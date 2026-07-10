@@ -1,240 +1,34 @@
-import express from 'express';
-import cors from 'cors';
-import { Battle } from '@pkmn/sim';
-import { Dex } from '@pkmn/dex';
-import { Teams } from '@pkmn/sets';
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// In-memory store for active non-PvP battles
-// Map: battleId (string) -> Battle instance
-const activeBattles = new Map();
+import { createApp } from './app.js';
+import { BattleManager } from './battle-manager.js';
+import { FoulPlayClient } from './foul-play-client.js';
 
 
-// --- SCHEDULED WAKE-UP DAEMON (11:00 - 23:30 CET) ---
-// Save Render's 500 free monthly hours by letting the server sleep at night.
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://pokemon-battle-api-bj3y.onrender.com';
+const foulPlayClient = new FoulPlayClient();
+const manager = new BattleManager({ foulPlayClient });
+const app = createApp(manager);
+const port = process.env.PORT || 3000;
 
-setInterval(() => {
-    // Get current time in Italy (CET/CEST)
-    const now = new Date();
-    const romeTimeStr = now.toLocaleString("en-US", { timeZone: "Europe/Rome" });
-    const romeDate = new Date(romeTimeStr);
-
-    const hours = romeDate.getHours();
-    const minutes = romeDate.getMinutes();
-    const timeVal = hours + (minutes / 60);
-
-    // Business hours: 11:00 to 23:30
-    if (timeVal >= 11 && timeVal <= 23.5) {
-        console.log(`[Daemon] Active Time (${hours}:${minutes.toString().padStart(2, '0')} CET) - Pinging self...`);
-        fetch(RENDER_URL).catch(err => console.error('[Daemon] Ping failed:', err.message));
-    } else {
-        console.log(`[Daemon] Sleep Time (${hours}:${minutes.toString().padStart(2, '0')} CET) - Skipping ping.`);
-    }
-}, 14 * 60 * 1000); // Check every 14 minutes
-
-// Root endpoint just for pings
-app.get('/', (req, res) => {
-    res.status(200).send('API is awake');
+app.listen(port, () => {
+    console.log(`Battle API listening on port ${port}`);
 });
 
-// Helper to generate a random battle ID
-const generateId = () => Math.random().toString(36).substring(2, 10);
+// Keep both free Render services awake only during the established Italian window.
+const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://pokemon-battle-api-bj3y.onrender.com';
+const wakeTimer = setInterval(async () => {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Rome',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+    }).formatToParts(new Date());
+    const hour = Number(parts.find(part => part.type === 'hour')?.value || 0);
+    const minute = Number(parts.find(part => part.type === 'minute')?.value || 0);
+    const time = hour + minute / 60;
+    if (time < 11 || time > 23.5) return;
 
-/**
- * Endpoint to start a new PvE battle.
- * Expects { playerTeam, opponentTeam, playerContext } in the body.
- * playerContext can contain format rules or custom seeds if needed.
- */
-app.post('/api/battle/start', (req, res) => {
-    try {
-        const { p1, p2 } = req.body;
-
-        if (!p1 || !p2) {
-            return res.status(400).json({ error: 'Missing p1 or p2 team configurations.' });
-        }
-
-        // Initialize a new battle instance using the loaded pkmn/sim
-        const battleOptions = {
-            formatid: 'gen9customgame', // Keep format flexible to allow all mons/moves
-            debug: true,
-            strictChoices: false,
-        };
-
-        const battle = new Battle(Object.assign({
-            send: (type, data) => {
-                // You can stream logs here, but typically we read them out after
-            }
-        }, battleOptions));
-
-        const battleId = generateId();
-
-        // Sanitize teams to ensure required fields (like moves) exist
-        const sanitizeTeam = (team) => {
-            if (!Array.isArray(team)) return [];
-            return team.map(mon => {
-                const safeMon = { ...mon };
-                if (!safeMon.moves || !Array.isArray(safeMon.moves) || safeMon.moves.length === 0) {
-                    safeMon.moves = ['Tackle']; // Fallback
-                }
-                // Ensure moves are strings (IDs)
-                safeMon.moves = safeMon.moves.map(m => typeof m === 'string' ? m : m.name || m.id || 'tackle');
-                return safeMon;
-            });
-        };
-
-        const safeP1Team = sanitizeTeam(p1.team);
-        const safeP2Team = sanitizeTeam(p2.team);
-
-        // Setup Players
-        battle.setPlayer('p1', { name: p1.name || 'Player', team: safeP1Team });
-        battle.setPlayer('p2', { name: p2.name || 'Wild Pokemon', team: safeP2Team });
-
-        // Store battle in memory
-        activeBattles.set(battleId, battle);
-
-        // Apply persistence (P1_STATE) to the server-side simulation before locking in leads
-        if (req.body.p1State && Object.keys(req.body.p1State).length > 0) {
-            const p1State = req.body.p1State;
-            battle.p1.pokemon.forEach(mon => {
-                const key = mon.name || mon.species.name;
-                const searchKeys = [key, mon.species.name, key.toLowerCase(), mon.species.name.toLowerCase()];
-                const matchedKey = searchKeys.find(k => p1State[k]);
-                if (matchedKey) {
-                    const s = p1State[matchedKey];
-                    if (s.hp !== undefined) {
-                        mon.hp = Math.max(0, Math.min(s.hp, mon.maxhp));
-                        if (mon.hp === 0) {
-                            mon.faint();
-                        }
-                    }
-                    if (s.status && s.status !== 'fnt') {
-                        mon.setStatus(s.status);
-                    }
-                }
-            });
-        }
-
-        // Force both players to select their lead Pokemon to pass teampreview
-        battle.choose('p1', 'team 1');
-        battle.choose('p2', 'team 1');
-        // Removed makeChoices() because it was auto-triggering turn 1 actions!
-
-        // Read the initial start log
-        const log = battle.log.join('\n');
-        battle.log = []; // Clear log for next fetch
-
-        // Extract basic state info
-        const state = {
-            p1Active: battle.p1.active[0] ? {
-                hp: battle.p1.active[0].hp,
-                maxhp: battle.p1.active[0].maxhp,
-                fainted: battle.p1.active[0].fainted,
-                name: battle.p1.active[0].name,
-                ident: battle.p1.active[0].ident
-            } : null,
-            p2Active: battle.p2.active[0] ? {
-                hp: battle.p2.active[0].hp,
-                maxhp: battle.p2.active[0].maxhp,
-                fainted: battle.p2.active[0].fainted,
-                name: battle.p2.active[0].name,
-                ident: battle.p2.active[0].ident
-            } : null,
-            ended: battle.ended,
-            winner: battle.winner
-        };
-
-        res.json({
-            success: true,
-            battleId,
-            log: log,
-            state: state
-        });
-
-    } catch (e) {
-        console.error("Start Battle Error:", e);
-        res.status(500).json({ error: e.message });
-    }
-});
-
-/**
- * Endpoint for a player to send an action (move, switch, run).
- */
-app.post('/api/battle/action', (req, res) => {
-    try {
-        const { battleId, action } = req.body;
-
-        if (!battleId || !activeBattles.has(battleId)) {
-            return res.status(404).json({ success: false, error: 'Battle not found or expired.' });
-        }
-
-        const battle = activeBattles.get(battleId);
-
-        // 1) Apply Player's choice
-        battle.choose('p1', action);
-
-        // 2) Apply AI's choice (Automated Random Wild AI for now)
-        let p2Choice = 'auto'; // Let sim auto-pick if possible
-        const p2Active = battle.p2.active[0];
-
-        if (p2Active && !p2Active.fainted) {
-            const validMoves = p2Active.moveSlots.map((m, idx) => idx + 1);
-            if (validMoves.length > 0) {
-                p2Choice = `move ${validMoves[Math.floor(Math.random() * validMoves.length)]}`;
-            }
-        }
-
-        battle.choose('p2', p2Choice);
-
-        // 3) Commit the choices
-        const log = battle.log.join('\n');
-        battle.log = []; // Clear log for the next turn
-
-        // Extract basic state info
-        const state = {
-            p1Active: battle.p1.active[0] ? {
-                hp: battle.p1.active[0].hp,
-                maxhp: battle.p1.active[0].maxhp,
-                fainted: battle.p1.active[0].fainted,
-                name: battle.p1.active[0].name,
-                ident: battle.p1.active[0].ident
-            } : null,
-            p2Active: battle.p2.active[0] ? {
-                hp: battle.p2.active[0].hp,
-                maxhp: battle.p2.active[0].maxhp,
-                fainted: battle.p2.active[0].fainted,
-                name: battle.p2.active[0].name,
-                ident: battle.p2.active[0].ident
-            } : null,
-            ended: battle.ended,
-            winner: battle.winner
-        };
-
-        if (battle.ended) {
-            activeBattles.delete(battleId);
-        }
-
-        res.json({
-            success: true,
-            log: log,
-            state: state
-        });
-
-    } catch (e) {
-        console.error("Action Error:", e);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/**
- * Health check endpoint
- */
-app.get('/', (req, res) => res.send('Pokémon Battle API is running.'));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Battle API listening on port ${PORT}`);
-});
+    await Promise.allSettled([
+        fetch(renderUrl),
+        foulPlayClient.health(),
+    ]);
+}, 14 * 60 * 1000);
+wakeTimer.unref?.();
