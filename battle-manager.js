@@ -63,19 +63,35 @@ function sideLog(rawLog, channel) {
 }
 
 function currentState(battle) {
-    const active = side => side.active[0] ? {
-        hp: side.active[0].hp,
-        maxhp: side.active[0].maxhp,
-        fainted: side.active[0].fainted,
-        name: side.active[0].name,
-        ident: side.active[0].ident,
-    } : null;
+    const active = side => {
+        const pokemon = side.active[0];
+        if (!pokemon) return null;
+        const slotIndex = side.pokemon.indexOf(pokemon);
+        return {
+            hp: pokemon.hp,
+            maxhp: pokemon.maxhp,
+            fainted: pokemon.fainted,
+            name: pokemon.name,
+            species: pokemon.species.name,
+            ident: pokemon.ident,
+            slot: pokemon.clientSlot ?? (slotIndex >= 0 ? slotIndex + 1 : null),
+        };
+    };
     return {
         p1Active: active(battle.p1),
         p2Active: active(battle.p2),
         ended: battle.ended,
         winner: battle.winner,
     };
+}
+
+function normalizePlayerAction(action, side) {
+    const match = typeof action === 'string' && action.trim().match(/^switch\s+(\d+)$/i);
+    if (!match) return action;
+
+    const clientSlot = Number(match[1]);
+    const simulatorSlot = side.pokemon.findIndex(pokemon => pokemon.clientSlot === clientSlot);
+    return simulatorSlot >= 0 ? `switch ${simulatorSlot + 1}` : action;
 }
 
 function requestType(request) {
@@ -203,6 +219,8 @@ export class BattleManager {
             name: payload.p2.name || (encounterType === 'trainer' ? 'Trainer' : 'Wild Pokemon'),
             team: sanitizeTeam(payload.p2.team),
         });
+        battle.p1.pokemon.forEach((pokemon, index) => { pokemon.clientSlot = index + 1; });
+        battle.p2.pokemon.forEach((pokemon, index) => { pokemon.clientSlot = index + 1; });
         applyP1State(battle, payload.p1State);
 
         const battleId = crypto.randomUUID();
@@ -380,7 +398,8 @@ export class BattleManager {
     async _executeAction(record, actionId, playerAction) {
         if (!record.pendingAction) {
             const p1Request = clone(record.battle.p1.activeRequest);
-            assertLegalChoice(playerAction, p1Request);
+            const normalizedPlayerAction = normalizePlayerAction(playerAction, record.battle.p1);
+            assertLegalChoice(normalizedPlayerAction, p1Request);
 
             let p2Choice = null;
             const p2Request = record.battle.p2.activeRequest;
@@ -389,7 +408,12 @@ export class BattleManager {
                     ? await this._trainerChoice(record)
                     : randomChoice(p2Request);
             }
-            record.pendingAction = { actionId, playerAction, p2Choice, applied: false };
+            record.pendingAction = {
+                actionId,
+                playerAction: normalizedPlayerAction,
+                p2Choice,
+                applied: false,
+            };
         }
 
         const pending = record.pendingAction;

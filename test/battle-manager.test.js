@@ -79,6 +79,36 @@ test('wild encounters never call Foul Play', async t => {
     assert.equal(ai.calls.length, 0);
 });
 
+test('player switch slots stay stable after Showdown reorders the party', async t => {
+    const ai = new FakeFoulPlay();
+    const manager = new BattleManager({ foulPlayClient: ai });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'stable-switch-start';
+    input.p1.team = [
+        pokemon('Garchomp', ['Protect']),
+        pokemon('Rotom-Wash', ['Protect']),
+    ];
+    input.p2.team = [pokemon('Blissey', ['Splash'])];
+
+    const started = await manager.start(input);
+    const switchedOut = await manager.action({
+        battleId: started.battleId,
+        actionId: 'stable-switch-1',
+        action: 'switch 2',
+    });
+    const switchedBack = await manager.action({
+        battleId: started.battleId,
+        actionId: 'stable-switch-2',
+        action: 'switch 1',
+    });
+
+    assert.equal(switchedOut.state.p1Active.species, 'Rotom-Wash');
+    assert.equal(switchedOut.state.p1Active.slot, 2);
+    assert.equal(switchedBack.state.p1Active.species, 'Garchomp');
+    assert.equal(switchedBack.state.p1Active.slot, 1);
+});
+
 test('trainer start is idempotent and sends only p2-private plus public data', async t => {
     const ai = new FakeFoulPlay(['team 1']);
     const manager = new BattleManager({
@@ -93,6 +123,10 @@ test('trainer start is idempotent and sends only p2-private plus public data', a
     const duplicate = await manager.start(input);
 
     assert.equal(first.battleId, duplicate.battleId);
+    assert.equal(first.state.p1Active.slot, 1);
+    assert.equal(first.state.p1Active.species, 'Pikachu');
+    assert.equal(first.state.p2Active.slot, 1);
+    assert.equal(first.state.p2Active.species, 'Garchomp');
     assert.equal(ai.calls.length, 1);
     assert.equal(ai.calls[0].initialRequest.side.id, 'p2');
     assert.equal(ai.calls[0].activeRequest.side.id, 'p2');
@@ -172,6 +206,8 @@ test('trainer forced switch is resolved by Foul Play and action retry is idempot
     const duplicate = await manager.action(action);
 
     assert.equal(first.state.p2Active.name, 'Weedle');
+    assert.equal(first.state.p2Active.slot, 2);
+    assert.equal(first.state.p2Active.species, 'Weedle');
     assert.deepEqual(duplicate, first);
     assert.deepEqual(ai.calls.map(call => call.requestType), ['team', 'move', 'switch']);
 });
