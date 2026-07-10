@@ -8,10 +8,11 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const twoHours = 2 * 60 * 60 * 1000;
 
 export class BattleInputError extends Error {
-    constructor(message, status = 400) {
+    constructor(message, status = 400, details = null) {
         super(message);
         this.name = 'BattleInputError';
         this.status = status;
+        this.details = details;
     }
 }
 
@@ -62,26 +63,115 @@ function sideLog(rawLog, channel) {
     return extractChannelMessages(rawLog, [channel])[channel].join('\n');
 }
 
-function currentState(battle) {
-    const active = side => {
-        const pokemon = side.active[0];
-        if (!pokemon) return null;
-        const slotIndex = side.pokemon.indexOf(pokemon);
-        return {
-            hp: pokemon.hp,
-            maxhp: pokemon.maxhp,
-            fainted: pokemon.fainted,
-            name: pokemon.name,
-            species: pokemon.species.name,
-            ident: pokemon.ident,
-            slot: pokemon.clientSlot ?? (slotIndex >= 0 ? slotIndex + 1 : null),
-        };
+function publicVolatiles(pokemon) {
+    return Object.fromEntries(Object.entries(pokemon.volatiles || {}).map(([id, value]) => {
+        const move = value?.move?.id || value?.move?.name || value?.move;
+        return [id, move ? { move } : {}];
+    }));
+}
+
+function snapshotPokemon(pokemon, side, { revealPrivate = false, requestMoves = null } = {}) {
+    const slotIndex = side.pokemon.indexOf(pokemon);
+    const snapshot = {
+        slot: pokemon.clientSlot ?? (slotIndex >= 0 ? slotIndex + 1 : null),
+        name: pokemon.name,
+        species: pokemon.species.name,
+        ident: pokemon.ident,
+        details: pokemon.details,
+        level: pokemon.level,
+        gender: pokemon.gender,
+        hp: pokemon.hp,
+        maxhp: pokemon.maxhp,
+        status: pokemon.status || '',
+        fainted: Boolean(pokemon.fainted),
+        active: side.active.includes(pokemon),
+        types: [...(pokemon.types || [])],
+        boosts: { ...(pokemon.boosts || {}) },
+        volatiles: publicVolatiles(pokemon),
     };
+
+    if (!revealPrivate) return snapshot;
+
+    const requestById = new Map((requestMoves || []).map(move => [move.id, move]));
+    snapshot.item = pokemon.item || '';
+    snapshot.ability = pokemon.ability || '';
+    snapshot.baseAbility = pokemon.baseAbility || '';
+    snapshot.pokeball = pokemon.pokeball || 'pokeball';
+    snapshot.storedStats = { ...(pokemon.storedStats || {}) };
+    snapshot.baseStats = { ...(pokemon.baseStoredStats || pokemon.storedStats || {}) };
+    snapshot.evs = { ...(pokemon.set?.evs || {}) };
+    snapshot.ivs = { ...(pokemon.set?.ivs || {}) };
+    snapshot.nature = pokemon.set?.nature || '';
+    snapshot.moveSlots = (pokemon.moveSlots || []).map((move, index) => {
+        const requested = requestById.get(move.id) || requestMoves?.[index];
+        return {
+            move: requested?.move || move.move,
+            id: requested?.id || move.id,
+            pp: requested?.pp ?? move.pp,
+            maxpp: requested?.maxpp ?? move.maxpp,
+            target: requested?.target || move.target,
+            disabled: Boolean(requested?.disabled ?? move.disabled),
+        };
+    });
+    return snapshot;
+}
+
+function snapshotSide(side, request, revealPrivate) {
+    const activePokemon = side.active[0] || null;
+    const activeRequestMoves = revealPrivate ? request?.active?.[0]?.moves || null : null;
+    const party = [...side.pokemon]
+        .sort((a, b) => (a.clientSlot || 0) - (b.clientSlot || 0))
+        .map(pokemon => snapshotPokemon(pokemon, side, {
+            revealPrivate,
+            requestMoves: pokemon === activePokemon ? activeRequestMoves : null,
+        }));
     return {
-        p1Active: active(battle.p1),
-        p2Active: active(battle.p2),
-        ended: battle.ended,
+        name: side.name,
+        activeSlot: activePokemon?.clientSlot || null,
+        party,
+    };
+}
+
+function currentState(record) {
+    const { battle } = record;
+    const request = battle.p1.activeRequest;
+    const ended = Boolean(record.endedReason || battle.ended);
+    const phase = ended
+        ? 'ended'
+        : request?.forceSwitch
+            ? 'switch'
+            : (!request || request.wait)
+                ? 'waiting'
+                : 'move';
+    const p1 = snapshotSide(battle.p1, request, true);
+    const p2 = snapshotSide(battle.p2, battle.p2.activeRequest, false);
+    const p1Active = p1.party.find(pokemon => pokemon.slot === p1.activeSlot) || null;
+    const p2Active = p2.party.find(pokemon => pokemon.slot === p2.activeSlot) || null;
+    const outcome = record.endedReason || (
+        battle.ended
+            ? (battle.winner === battle.p1.name ? 'win' : battle.winner ? 'loss' : 'tie')
+            : null
+    );
+
+    return {
+        schemaVersion: 2,
+        revision: record.revision,
+        turn: battle.turn,
+        phase,
+        canAct: phase === 'move' || phase === 'switch',
+        request: {
+            forceSwitch: Boolean(request?.forceSwitch),
+            wait: Boolean(request?.wait),
+            trapped: Boolean(request?.active?.[0]?.trapped),
+        },
+        p1,
+        p2,
+        // Compatibility aliases for clients deployed before schema v2.
+        p1Active,
+        p2Active,
+        ended,
         winner: battle.winner,
+        outcome,
     };
 }
 
@@ -138,22 +228,72 @@ function assertLegalChoice(action, request) {
     throw new BattleInputError('Action does not match the current battle request.');
 }
 
-function randomChoice(request) {
+function randomChoice(request, random = Math.random) {
     if (request?.forceSwitch) {
         const candidates = request.side.pokemon
             .map((pokemon, index) => ({ pokemon, index: index + 1 }))
             .filter(({ pokemon }) => !pokemon.active && !conditionIsFainted(pokemon.condition));
         if (!candidates.length) return null;
-        return `switch ${candidates[Math.floor(Math.random() * candidates.length)].index}`;
+        return `switch ${candidates[Math.floor(random() * candidates.length)].index}`;
     }
     if (request?.active) {
         const candidates = request.active[0].moves
             .map((move, index) => ({ move, index: index + 1 }))
             .filter(({ move }) => !move.disabled && move.pp !== 0);
         if (!candidates.length) return 'move 1';
-        return `move ${candidates[Math.floor(Math.random() * candidates.length)].index}`;
+        return `move ${candidates[Math.floor(random() * candidates.length)].index}`;
     }
     return null;
+}
+
+function addTemporarySplashChoice(battle) {
+    const pokemon = battle.p1.active[0];
+    const requestMoves = battle.p1.activeRequest?.active?.[0]?.moves;
+    if (!pokemon || !requestMoves) {
+        throw new BattleInputError('A turn cannot be consumed in the current phase.');
+    }
+
+    const existingIndex = pokemon.moveSlots.findIndex(move => move.id === 'splash');
+    if (existingIndex >= 0) {
+        const originalPp = pokemon.moveSlots[existingIndex].pp;
+        return {
+            choice: `move ${existingIndex + 1}`,
+            cleanup: () => {
+                pokemon.moveSlots[existingIndex].pp = originalPp;
+                const requested = battle.p1.activeRequest?.active?.[0]?.moves
+                    ?.find(move => move.id === 'splash');
+                if (requested) requested.pp = originalPp;
+            },
+        };
+    }
+
+    const splash = {
+        move: 'Splash',
+        id: 'splash',
+        pp: 40,
+        maxpp: 40,
+        target: 'self',
+        disabled: false,
+        disabledSource: '',
+        used: false,
+    };
+    pokemon.moveSlots.push({ ...splash });
+    pokemon.baseMoveSlots.push({ ...splash });
+    requestMoves.push({ ...splash });
+    const choice = `move ${pokemon.moveSlots.length}`;
+
+    return {
+        choice,
+        cleanup: () => {
+            const removeSplash = moves => {
+                const index = moves?.findIndex(move => move.id === 'splash');
+                if (index >= 0) moves.splice(index, 1);
+            };
+            removeSplash(pokemon.moveSlots);
+            removeSplash(pokemon.baseMoveSlots);
+            removeSplash(battle.p1.activeRequest?.active?.[0]?.moves);
+        },
+    };
 }
 
 export class BattleManager {
@@ -164,6 +304,7 @@ export class BattleManager {
         searchBudgetMs = Number(process.env.FOUL_PLAY_SEARCH_BUDGET_MS || 2000),
         abortAfterMs = Number(process.env.TRAINER_AI_ABORT_AFTER_MS || 120000),
         now = () => Date.now(),
+        random = Math.random,
     } = {}) {
         this.foulPlayClient = foulPlayClient;
         this.trainerTicketSecret = trainerTicketSecret;
@@ -171,6 +312,7 @@ export class BattleManager {
         this.searchBudgetMs = Math.max(100, Math.min(searchBudgetMs, 2000));
         this.abortAfterMs = abortAfterMs;
         this.now = now;
+        this.random = random;
         this.records = new Map();
         this.startRequests = new Map();
 
@@ -237,8 +379,13 @@ export class BattleManager {
             started: false,
             startResponse: null,
             aiUnavailableSince: null,
+            revision: 0,
+            endedReason: null,
+            escapeAttempts: 0,
             actionResponses: new Map(),
             actionPromises: new Map(),
+            actionFingerprints: new Map(),
+            resolvingActionId: null,
             pendingAction: null,
         };
         this.records.set(battleId, record);
@@ -303,12 +450,13 @@ export class BattleManager {
 
         const log = this._drainLogs(record);
         record.started = true;
+        record.revision = 1;
         record.lastAccess = this.now();
         record.startResponse = {
             success: true,
             battleId: record.battleId,
             log,
-            state: currentState(record.battle),
+            state: currentState(record),
             trainer: record.encounterType === 'trainer',
             testMode: record.testMode,
         };
@@ -380,37 +528,128 @@ export class BattleManager {
             throw new BattleInputError('A valid actionId is required.');
         }
         record.lastAccess = this.now();
+        const fingerprint = String(payload.action || '');
+        const previousFingerprint = record.actionFingerprints.get(actionId);
+        if (previousFingerprint !== undefined && previousFingerprint !== fingerprint) {
+            throw new BattleInputError('actionId was reused with a different action.', 409, {
+                state: currentState(record),
+            });
+        }
+        if (previousFingerprint === undefined) record.actionFingerprints.set(actionId, fingerprint);
         if (record.actionResponses.has(actionId)) return record.actionResponses.get(actionId);
         if (record.actionPromises.has(actionId)) return record.actionPromises.get(actionId);
+        if (record.endedReason || record.battle.ended) {
+            throw new BattleInputError('Battle has already ended.', 409, { state: currentState(record) });
+        }
+        if (
+            payload.expectedRevision !== undefined &&
+            Number(payload.expectedRevision) !== record.revision
+        ) {
+            throw new BattleInputError('Battle state is stale.', 409, { state: currentState(record) });
+        }
         if (record.pendingAction && record.pendingAction.actionId !== actionId) {
-            throw new BattleInputError('A previous trainer action is still being resolved.', 409);
+            throw new BattleInputError('A previous trainer action is still being resolved.', 409, {
+                state: currentState(record),
+            });
+        }
+        if (record.resolvingActionId && record.resolvingActionId !== actionId) {
+            throw new BattleInputError('A previous trainer action is still being resolved.', 409, {
+                state: currentState(record),
+            });
         }
 
+        record.resolvingActionId = actionId;
         const promise = this._executeAction(record, actionId, payload.action);
         record.actionPromises.set(actionId, promise);
         try {
             return await promise;
         } finally {
             record.actionPromises.delete(actionId);
+            if (record.resolvingActionId === actionId) record.resolvingActionId = null;
         }
+    }
+
+    async state(payload) {
+        const record = this.records.get(payload?.battleId);
+        if (!record || !record.started) {
+            throw new BattleInputError('Battle not found or expired.', 404);
+        }
+        record.lastAccess = this.now();
+        return {
+            success: true,
+            battleId: record.battleId,
+            state: currentState(record),
+            trainer: record.encounterType === 'trainer',
+            testMode: record.testMode,
+        };
+    }
+
+    _runEscapes(record) {
+        const p1 = record.battle.p1.active[0];
+        const p2 = record.battle.p2.active[0];
+        if (!p1 || !p2) throw new BattleInputError('Run is unavailable in the current phase.');
+
+        const playerSpeed = p1.speed;
+        const opponentSpeed = p2.speed % 256 || 1;
+        record.escapeAttempts++;
+        const threshold = playerSpeed >= opponentSpeed
+            ? 256
+            : Math.floor((playerSpeed * 128) / opponentSpeed) + (30 * record.escapeAttempts);
+        return Math.floor(this.random() * 256) < threshold;
+    }
+
+    _escapedResponse(record, actionId) {
+        record.endedReason = 'escaped';
+        record.revision++;
+        const response = {
+            success: true,
+            escaped: true,
+            log: '|covenant|escaped',
+            state: currentState(record),
+            trainer: false,
+            testMode: record.testMode,
+        };
+        record.actionResponses.set(actionId, response);
+        return response;
     }
 
     async _executeAction(record, actionId, playerAction) {
         if (!record.pendingAction) {
             const p1Request = clone(record.battle.p1.activeRequest);
             const normalizedPlayerAction = normalizePlayerAction(playerAction, record.battle.p1);
-            assertLegalChoice(normalizedPlayerAction, p1Request);
+            const specialAction = ['capture', 'run'].includes(normalizedPlayerAction)
+                ? normalizedPlayerAction
+                : null;
+            if (specialAction) {
+                if (record.encounterType !== 'wild') {
+                    throw new BattleInputError('That action is only available in wild battles.');
+                }
+                if (!p1Request?.active || p1Request.forceSwitch || p1Request.wait) {
+                    throw new BattleInputError('That action is unavailable in the current phase.');
+                }
+                if (specialAction === 'run' && this._runEscapes(record)) {
+                    return this._escapedResponse(record, actionId);
+                }
+            } else {
+                assertLegalChoice(normalizedPlayerAction, p1Request);
+            }
 
             let p2Choice = null;
             const p2Request = record.battle.p2.activeRequest;
             if (p2Request && !p2Request.wait) {
                 p2Choice = record.encounterType === 'trainer'
                     ? await this._trainerChoice(record)
-                    : randomChoice(p2Request);
+                    : randomChoice(p2Request, this.random);
             }
             record.pendingAction = {
                 actionId,
                 playerAction: normalizedPlayerAction,
+                specialAction,
+                specialLog: specialAction === 'capture'
+                    ? '|covenant|capturefailed'
+                    : specialAction === 'run'
+                        ? '|covenant|runfailed'
+                        : '',
                 p2Choice,
                 applied: false,
             };
@@ -418,26 +657,37 @@ export class BattleManager {
 
         const pending = record.pendingAction;
         if (!pending.applied) {
-            if (!record.battle.choose('p1', pending.playerAction)) {
-                record.battle.p1.clearChoice();
-                record.pendingAction = null;
-                throw new BattleInputError('The player action was rejected by the simulator.');
-            }
-            if (pending.p2Choice && !record.battle.choose('p2', pending.p2Choice)) {
-                record.battle.p1.clearChoice();
-                record.battle.p2.clearChoice();
-                record.pendingAction = null;
-                throw new BattleInputError('The opponent action was rejected by the simulator.');
+            const temporaryChoice = pending.specialAction
+                ? addTemporarySplashChoice(record.battle)
+                : null;
+            const p1Choice = temporaryChoice?.choice || pending.playerAction;
+            try {
+                if (!record.battle.choose('p1', p1Choice)) {
+                    record.battle.p1.clearChoice();
+                    record.pendingAction = null;
+                    throw new BattleInputError('The player action was rejected by the simulator.');
+                }
+                if (pending.p2Choice && !record.battle.choose('p2', pending.p2Choice)) {
+                    record.battle.p1.clearChoice();
+                    record.battle.p2.clearChoice();
+                    record.pendingAction = null;
+                    throw new BattleInputError('The opponent action was rejected by the simulator.');
+                }
+            } finally {
+                temporaryChoice?.cleanup();
             }
             pending.applied = true;
         }
 
         await this._resolveP2ForcedSwitch(record);
-        const log = this._drainLogs(record);
+        const battleLog = this._drainLogs(record);
+        const log = [pending.specialLog, battleLog].filter(Boolean).join('\n');
+        record.revision++;
         const response = {
             success: true,
+            ...(pending.specialAction === 'run' ? { escaped: false } : {}),
             log,
-            state: currentState(record.battle),
+            state: currentState(record),
             trainer: record.encounterType === 'trainer',
             testMode: record.testMode,
         };
@@ -456,7 +706,7 @@ export class BattleManager {
             if (++safety > 6) throw new Error('Too many consecutive forced switches.');
             const choice = record.encounterType === 'trainer'
                 ? await this._trainerChoice(record)
-                : randomChoice(record.battle.p2.activeRequest);
+                : randomChoice(record.battle.p2.activeRequest, this.random);
             if (!choice || !record.battle.choose('p2', choice)) {
                 throw new BattleInputError('The opponent forced switch was rejected.');
             }

@@ -51,7 +51,11 @@ export function createApp(manager) {
                 return;
             }
             if (error instanceof BattleInputError) {
-                res.status(error.status).json({ success: false, error: error.message });
+                res.status(error.status).json({
+                    success: false,
+                    error: error.message,
+                    ...(error.details || {}),
+                });
                 return;
             }
             console.error('[Battle API] Unexpected error:', error);
@@ -61,6 +65,7 @@ export function createApp(manager) {
 
     app.post('/api/battle/start', verifySignature, handle(body => manager.start(body)));
     app.post('/api/battle/action', verifySignature, handle(body => manager.action(body)));
+    app.post('/api/battle/state', verifySignature, handle(body => manager.state(body)));
     app.get('/api/health', (req, res) => res.json({
         ok: true,
         trainerAiEnabled: manager.trainerAiEnabled,
