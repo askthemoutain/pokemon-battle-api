@@ -35,7 +35,7 @@ function bundle(suffix = '1') {
         localBattleId,
         sub: participants[side],
         side,
-        exp,
+        exp: Math.floor(Date.now() / 1000) + (2 * 60 * 60),
     }, SECRET);
     return { localBattleId, participants, teams, battleTicket, sideTicket };
 }
@@ -155,6 +155,41 @@ test('a player can claim a signed win after the opponent turn timeout', async t 
     assert.equal(claimed.state.reason, 'turn-timeout');
     assert.equal(claimed.state.winner, data.participants.p1);
     assert.equal(typeof claimed.receipt, 'string');
+});
+
+test('polling resolves an abandoned submitted turn without a client claim', async t => {
+    let now = Date.now();
+    const manager = new PvpBattleManager({ ticketSecret: SECRET, now: () => now });
+    t.after(() => manager.close());
+    const data = bundle('7');
+    const started = await start(manager, data, '7');
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'p1-abandoned-choice',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    now += 3 * 60 * 1000 + 1;
+    const expired = await manager.state({ battleId: started.battleId, sideTicket: data.sideTicket('p1') });
+    assert.equal(expired.state.ended, true);
+    assert.equal(expired.state.reason, 'turn-timeout');
+    assert.equal(expired.state.winner, data.participants.p1);
+    assert.equal(typeof expired.receipt, 'string');
+});
+
+test('thirty idle minutes end in a signed draw refund', async t => {
+    let now = Date.now();
+    const manager = new PvpBattleManager({ ticketSecret: SECRET, now: () => now });
+    t.after(() => manager.close());
+    const data = bundle('8');
+    const started = await start(manager, data, '8');
+    now += 30 * 60 * 1000 + 1;
+    const expired = await manager.state({ battleId: started.battleId, sideTicket: data.sideTicket('p2') });
+    assert.equal(expired.state.ended, true);
+    assert.equal(expired.state.reason, 'idle-timeout');
+    assert.equal(expired.state.winner, '');
+    assert.equal(typeof expired.receipt, 'string');
 });
 
 test('lost Node state yields signed recovery only after the record disappears', async t => {

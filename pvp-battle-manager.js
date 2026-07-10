@@ -11,6 +11,7 @@ import {
 
 const twoHours = 2 * 60 * 60 * 1000;
 const turnTimeout = 3 * 60 * 1000;
+const idleMatchTimeout = 30 * 60 * 1000;
 const clone = value => JSON.parse(JSON.stringify(value));
 
 export class PvpInputError extends Error {
@@ -162,6 +163,7 @@ function currentState(record, perspective) {
         pendingSides: Object.keys(record.pendingChoices),
         pendingSince: Object.fromEntries(Object.entries(record.pendingChoices)
             .map(([pendingSide, choice]) => [pendingSide, choice.submittedAt])),
+        idleDeadlineAt: record.lastProgressAt + idleMatchTimeout,
         ended,
         winner: record.battle.winner || '',
         reason: record.endedReason || '',
@@ -218,6 +220,29 @@ export class PvpBattleManager {
         for (const side of ['p1', 'p2']) {
             const visible = sideLog(raw, side === 'p1' ? 1 : 2);
             if (visible) record.logs[side].push(...visible.split('\n').filter(Boolean));
+        }
+    }
+
+    _endByClock(record) {
+        if (record.battle.ended || record.endedReason) return;
+        const pending = Object.entries(record.pendingChoices);
+        if (pending.length === 1 && this.now() - pending[0][1].submittedAt >= turnTimeout) {
+            const winnerSide = pending[0][0];
+            const loserSide = winnerSide === 'p1' ? 'p2' : 'p1';
+            record.endedReason = 'turn-timeout';
+            record.battle.winner = record.participants[winnerSide];
+            record.revision++;
+            record.pendingChoices = {};
+            record.logs.p1.push(`|covenant|timeout|${loserSide}`);
+            record.logs.p2.push(`|covenant|timeout|${loserSide}`);
+            return;
+        }
+        if (pending.length === 0 && this.now() - record.lastProgressAt >= idleMatchTimeout) {
+            record.endedReason = 'idle-timeout';
+            record.battle.winner = '';
+            record.revision++;
+            record.logs.p1.push('|covenant|idle-timeout|draw');
+            record.logs.p2.push('|covenant|idle-timeout|draw');
         }
     }
 
@@ -281,6 +306,7 @@ export class PvpBattleManager {
             revision: 1,
             createdAt: now,
             lastAccess: now,
+            lastProgressAt: now,
             pendingChoices: {},
             actionFingerprints: new Map(),
             actionResponses: new Map(),
@@ -298,12 +324,14 @@ export class PvpBattleManager {
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
         const sideTicket = this._verifySide(record, payload.sideTicket);
         record.lastAccess = this.now();
+        this._endByClock(record);
         return this._response(record, sideTicket.side);
     }
 
     async action(payload) {
         const record = this.records.get(payload?.battleId);
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
+        this._endByClock(record);
         if (record.battle.ended || record.endedReason) throw new PvpInputError('PvP battle already ended.', 409);
         const sideTicket = this._verifySide(record, payload.sideTicket);
         const side = sideTicket.side;
@@ -325,6 +353,7 @@ export class PvpBattleManager {
         assertLegalChoice(action, simulatorSide.activeRequest);
         record.actionFingerprints.set(key, fingerprint);
         record.pendingChoices[side] = { action, actionId, key, submittedAt: this.now() };
+        record.lastProgressAt = this.now();
 
         const requiredSides = ['p1', 'p2'].filter(candidate => {
             const request = record.battle[candidate].activeRequest;
@@ -347,6 +376,7 @@ export class PvpBattleManager {
         record.pendingChoices = {};
         record.revision++;
         record.lastAccess = this.now();
+        record.lastProgressAt = this.now();
         this._drainLogs(record);
         const response = this._response(record, side, { accepted: true, resolved: true });
         record.actionResponses.set(key, response);
@@ -357,6 +387,7 @@ export class PvpBattleManager {
         const record = this.records.get(payload?.battleId);
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
         const sideTicket = this._verifySide(record, payload.sideTicket);
+        this._endByClock(record);
         if (!record.battle.ended && !record.endedReason) {
             const winnerSide = sideTicket.side === 'p1' ? 'p2' : 'p1';
             record.endedReason = 'forfeit';
@@ -372,6 +403,7 @@ export class PvpBattleManager {
         const record = this.records.get(payload?.battleId);
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
         const sideTicket = this._verifySide(record, payload.sideTicket);
+        this._endByClock(record);
         if (record.battle.ended || record.endedReason) return this._response(record, sideTicket.side);
         const ownChoice = record.pendingChoices[sideTicket.side];
         const opponentSide = sideTicket.side === 'p1' ? 'p2' : 'p1';
@@ -402,6 +434,7 @@ export class PvpBattleManager {
         const record = [...this.records.values()].find(candidate => candidate.localBattleId === sideTicket.localBattleId);
         if (record) {
             this._verifySide(record, payload.sideTicket);
+            this._endByClock(record);
             return this._response(record, sideTicket.side, { recovered: true });
         }
         return {
