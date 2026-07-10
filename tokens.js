@@ -37,6 +37,10 @@ function verifySignedToken(token, secret) {
     }
 }
 
+function assertFresh(payload, nowSeconds) {
+    return Number.isInteger(payload?.exp) && payload.exp >= nowSeconds;
+}
+
 export function verifyTrainerTicket(token, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
     const payload = verifySignedToken(token, secret);
 
@@ -68,6 +72,74 @@ export function verifyBattleTicket(token, secret, nowSeconds = Math.floor(Date.n
         throw new Error('Battle ticket is expired or invalid.');
     }
     return payload;
+}
+
+export function verifyPvpBattleTicket(token, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+    const payload = verifySignedToken(token, secret);
+    if (
+        payload.v !== 1 ||
+        payload.kind !== 'pvp-battle' ||
+        payload.aud !== 'pokemon-battle-api' ||
+        !payload.localBattleId ||
+        !payload.participants?.p1 ||
+        !payload.participants?.p2 ||
+        !Array.isArray(payload.teams?.p1) || !payload.teams.p1.length ||
+        !Array.isArray(payload.teams?.p2) || !payload.teams.p2.length ||
+        !assertFresh(payload, nowSeconds)
+    ) {
+        throw new Error('PvP battle ticket is expired or invalid.');
+    }
+    return payload;
+}
+
+export function verifyPvpSideTicket(token, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+    const payload = verifySignedToken(token, secret);
+    if (
+        payload.v !== 1 ||
+        payload.kind !== 'pvp-side' ||
+        payload.aud !== 'pokemon-battle-api' ||
+        !payload.localBattleId ||
+        !['p1', 'p2'].includes(payload.side) ||
+        !payload.sub ||
+        !assertFresh(payload, nowSeconds)
+    ) {
+        throw new Error('PvP side ticket is expired or invalid.');
+    }
+    return payload;
+}
+
+export function createPvpReceipt(record, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+    return signToken({
+        v: 1,
+        kind: 'pvp-receipt',
+        aud: 'pokemon-covenant-php',
+        localBattleId: record.localBattleId,
+        battleId: record.battleId,
+        revision: record.revision,
+        participants: record.participants,
+        state: {
+            ended: Boolean(record.battle.ended || record.endedReason),
+            winner: record.battle.winner || '',
+            reason: record.endedReason || (record.battle.ended ? 'battle' : ''),
+            turn: record.battle.turn,
+        },
+        iat: nowSeconds,
+        exp: nowSeconds + (2 * 60 * 60),
+    }, secret);
+}
+
+export function createPvpRecoveryToken(sideTicket, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+    return signToken({
+        v: 1,
+        kind: 'pvp-recovery',
+        aud: 'pokemon-covenant-php',
+        localBattleId: sideTicket.localBattleId,
+        sub: sideTicket.sub,
+        side: sideTicket.side,
+        reason: 'node-state-lost',
+        iat: nowSeconds,
+        exp: nowSeconds + 5 * 60,
+    }, secret);
 }
 
 export function createBattleReceipt(record, secret, nowSeconds = Math.floor(Date.now() / 1000)) {

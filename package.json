@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check app.js && node --check battle-manager.js && node --check foul-play-client.js && node --check tokens.js",
+    "check": "node --check server.js && node --check app.js && node --check battle-manager.js && node --check pvp-battle-manager.js && node --check foul-play-client.js && node --check tokens.js",
     "test": "node --test test/*.test.js"
   },
   "keywords": [],

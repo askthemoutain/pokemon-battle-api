@@ -1,11 +1,13 @@
 import { createApp } from './app.js';
 import { BattleManager } from './battle-manager.js';
 import { FoulPlayClient } from './foul-play-client.js';
+import { PvpBattleManager } from './pvp-battle-manager.js';
 
 
 const foulPlayClient = new FoulPlayClient();
 const manager = new BattleManager({ foulPlayClient });
-const app = createApp(manager);
+const pvpManager = new PvpBattleManager();
+const app = createApp(manager, pvpManager);
 const port = process.env.PORT || 3000;
 
 app.listen(port, () => {

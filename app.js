@@ -3,9 +3,10 @@ import express from 'express';
 import cors from 'cors';
 
 import { BattleInputError, TrainerUnavailableError } from './battle-manager.js';
+import { PvpInputError } from './pvp-battle-manager.js';
 
 
-export function createApp(manager) {
+export function createApp(manager, pvpManager = null) {
     const app = express();
     const allowedOrigins = (
         process.env.ALLOWED_ORIGINS || 'https://pokemoncovenant.altervista.org,http://gdrcd.test'
@@ -58,6 +59,14 @@ export function createApp(manager) {
                 });
                 return;
             }
+            if (error instanceof PvpInputError) {
+                res.status(error.status).json({
+                    success: false,
+                    error: error.message,
+                    ...(error.details || {}),
+                });
+                return;
+            }
             console.error('[Battle API] Unexpected error:', error);
             res.status(500).json({ success: false, error: 'Internal battle service error.' });
         }
@@ -66,11 +75,20 @@ export function createApp(manager) {
     app.post('/api/battle/start', verifySignature, handle(body => manager.start(body)));
     app.post('/api/battle/action', verifySignature, handle(body => manager.action(body)));
     app.post('/api/battle/state', verifySignature, handle(body => manager.state(body)));
+    if (pvpManager) {
+        app.post('/api/pvp/start', verifySignature, handle(body => pvpManager.start(body)));
+        app.post('/api/pvp/action', verifySignature, handle(body => pvpManager.action(body)));
+        app.post('/api/pvp/state', verifySignature, handle(body => pvpManager.state(body)));
+        app.post('/api/pvp/forfeit', verifySignature, handle(body => pvpManager.forfeit(body)));
+        app.post('/api/pvp/timeout', verifySignature, handle(body => pvpManager.claimTimeout(body)));
+        app.post('/api/pvp/recover', verifySignature, handle(body => pvpManager.recover(body)));
+    }
     app.get('/api/health', (req, res) => res.json({
         ok: true,
         trainerAiEnabled: manager.trainerAiEnabled,
         foulPlayConfigured: Boolean(manager.foulPlayClient?.configured),
         activeBattles: manager.records.size,
+        activePvpBattles: pvpManager ? pvpManager.records.size : 0,
     }));
     app.get('/', (req, res) => res.status(200).send('Pokemon Battle API is running.'));
     return app;
