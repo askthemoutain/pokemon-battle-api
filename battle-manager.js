@@ -1,11 +1,13 @@
 import crypto from 'node:crypto';
-import { Battle, extractChannelMessages } from '@pkmn/sim';
+import { Battle, Dex, extractChannelMessages } from '@pkmn/sim';
 
-import { createAbortToken, verifyTrainerTicket } from './tokens.js';
+import { createAbortToken, createBattleReceipt, verifyBattleTicket, verifyTrainerTicket } from './tokens.js';
 
 
 const clone = value => JSON.parse(JSON.stringify(value));
 const twoHours = 2 * 60 * 60 * 1000;
+
+const speciesId = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
 export class BattleInputError extends Error {
     constructor(message, status = 400, details = null) {
@@ -38,6 +40,45 @@ function sanitizeTeam(team) {
             typeof move === 'string' ? move : move?.name || move?.id || 'tackle'
         ));
         return safeMon;
+    });
+}
+
+function levelUpMoves(speciesName, level) {
+    const learned = new Map();
+    let species = Dex.species.get(speciesName);
+    while (species?.exists) {
+        const learnset = Dex.mod('gen9').data.Learnsets?.[speciesId(species.name)]?.learnset || {};
+        for (const [move, sources] of Object.entries(learnset)) {
+            for (const source of sources) {
+                const match = source.match(/^9L(\d+)$/);
+                if (!match) continue;
+                const learnedAt = Number(match[1]) || 1;
+                if (learnedAt <= level && (!learned.has(move) || learned.get(move) < learnedAt)) {
+                    learned.set(move, learnedAt);
+                }
+            }
+        }
+        species = species.prevo ? Dex.species.get(species.prevo) : null;
+    }
+    const moves = [...learned.entries()]
+        .sort((a, b) => a[1] - b[1])
+        .slice(-4)
+        .map(([move]) => move);
+    return moves.length ? moves : ['tackle'];
+}
+
+function canonicalWildTeam(opponents) {
+    return opponents.map(opponent => {
+        const level = Math.max(1, Math.min(100, Number(opponent.level) || 1));
+        return {
+            species: opponent.species,
+            level,
+            shiny: Boolean(opponent.shiny),
+            nature: 'Serious',
+            ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+            evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+            moves: levelUpMoves(opponent.species, level),
+        };
     });
 }
 
@@ -353,17 +394,23 @@ export class BattleManager {
             debug: process.env.BATTLE_DEBUG === '1',
             strictChoices: false,
         });
+        const p1Team = ticketPayload?.kind === 'battle'
+            ? sanitizeTeam(ticketPayload.players || [])
+            : sanitizeTeam(payload.p1.team);
         battle.setPlayer('p1', {
-            name: payload.p1.name || 'Player',
-            team: sanitizeTeam(payload.p1.team),
+            name: ticketPayload?.sub || payload.p1.name || 'Player',
+            team: p1Team,
         });
+        const p2Team = ticketPayload?.kind === 'battle' && encounterType === 'wild'
+            ? canonicalWildTeam(ticketPayload.opponents || [])
+            : sanitizeTeam(payload.p2.team);
         battle.setPlayer('p2', {
             name: payload.p2.name || (encounterType === 'trainer' ? 'Trainer' : 'Wild Pokemon'),
-            team: sanitizeTeam(payload.p2.team),
+            team: p2Team,
         });
         battle.p1.pokemon.forEach((pokemon, index) => { pokemon.clientSlot = index + 1; });
         battle.p2.pokemon.forEach((pokemon, index) => { pokemon.clientSlot = index + 1; });
-        applyP1State(battle, payload.p1State);
+        applyP1State(battle, ticketPayload?.kind === 'battle' ? ticketPayload.playerState : payload.p1State);
 
         const battleId = crypto.randomUUID();
         const createdAt = this.now();
@@ -371,6 +418,8 @@ export class BattleManager {
             battleId,
             battle,
             encounterType,
+            subject: ticketPayload?.sub || '',
+            localBattleId: ticketPayload?.localBattleId || '',
             testMode: Boolean(ticketPayload?.testMode),
             initialP2Request: clone(battle.p2.activeRequest),
             p2ProtocolHistory: '',
@@ -382,6 +431,7 @@ export class BattleManager {
             revision: 0,
             endedReason: null,
             escapeAttempts: 0,
+            participatedSlots: new Set([1]),
             actionResponses: new Map(),
             actionPromises: new Map(),
             actionFingerprints: new Map(),
@@ -398,7 +448,24 @@ export class BattleManager {
         }
         const encounterType = payload.encounterType === 'trainer' ? 'trainer' : 'wild';
         let ticketPayload = null;
-        if (encounterType === 'trainer') {
+        if (payload.battleTicket) {
+            try {
+                ticketPayload = verifyBattleTicket(payload.battleTicket, this.trainerTicketSecret);
+            } catch (error) {
+                throw new BattleInputError(error.message, 401);
+            }
+            if (ticketPayload.encounterType !== encounterType) {
+                throw new BattleInputError('Battle ticket encounter type does not match.', 401);
+            }
+            const expectedOpponents = ticketPayload.opponents || [];
+            const suppliedOpponents = payload.p2.team || [];
+            if (expectedOpponents.length !== suppliedOpponents.length || expectedOpponents.some((expected, index) => (
+                speciesId(expected.species) !== speciesId(suppliedOpponents[index]?.species) ||
+                Number(expected.level) !== Number(suppliedOpponents[index]?.level)
+            ))) {
+                throw new BattleInputError('Opponent team does not match the signed battle ticket.', 401);
+            }
+        } else if (encounterType === 'trainer') {
             if (!this.trainerAiEnabled) {
                 throw new BattleInputError('Trainer AI is not enabled.', 503);
             }
@@ -407,6 +474,12 @@ export class BattleManager {
             } catch (error) {
                 throw new BattleInputError(error.message, 401);
             }
+        }
+        if (encounterType === 'trainer' && !this.trainerAiEnabled) {
+            throw new BattleInputError('Trainer AI is not enabled.', 503);
+        }
+        if (this.trainerTicketSecret && !ticketPayload) {
+            throw new BattleInputError('A signed battle ticket is required.', 401);
         }
 
         const requestId = payload.requestId || (encounterType === 'wild' ? crypto.randomUUID() : '');
@@ -452,15 +525,24 @@ export class BattleManager {
         record.started = true;
         record.revision = 1;
         record.lastAccess = this.now();
-        record.startResponse = {
+        record.startResponse = this._withReceipt(record, {
             success: true,
             battleId: record.battleId,
             log,
             state: currentState(record),
             trainer: record.encounterType === 'trainer',
             testMode: record.testMode,
-        };
+        });
         return record.startResponse;
+    }
+
+    _withReceipt(record, response) {
+        if (!record.subject || !record.localBattleId || !this.trainerTicketSecret) return response;
+        record.publicState = response.state || currentState(record);
+        return {
+            ...response,
+            receipt: createBattleReceipt(record, this.trainerTicketSecret, Math.floor(this.now() / 1000)),
+        };
     }
 
     _p2Transcript(record) {
@@ -575,13 +657,13 @@ export class BattleManager {
             throw new BattleInputError('Battle not found or expired.', 404);
         }
         record.lastAccess = this.now();
-        return {
+        return this._withReceipt(record, {
             success: true,
             battleId: record.battleId,
             state: currentState(record),
             trainer: record.encounterType === 'trainer',
             testMode: record.testMode,
-        };
+        });
     }
 
     _runEscapes(record) {
@@ -601,14 +683,14 @@ export class BattleManager {
     _escapedResponse(record, actionId) {
         record.endedReason = 'escaped';
         record.revision++;
-        const response = {
+        const response = this._withReceipt(record, {
             success: true,
             escaped: true,
             log: '|covenant|escaped',
             state: currentState(record),
             trainer: false,
             testMode: record.testMode,
-        };
+        });
         record.actionResponses.set(actionId, response);
         return response;
     }
@@ -680,17 +762,19 @@ export class BattleManager {
         }
 
         await this._resolveP2ForcedSwitch(record);
+        const activePlayer = record.battle.p1.active[0];
+        if (activePlayer?.clientSlot) record.participatedSlots.add(activePlayer.clientSlot);
         const battleLog = this._drainLogs(record);
         const log = [pending.specialLog, battleLog].filter(Boolean).join('\n');
         record.revision++;
-        const response = {
+        const response = this._withReceipt(record, {
             success: true,
             ...(pending.specialAction === 'run' ? { escaped: false } : {}),
             log,
             state: currentState(record),
             trainer: record.encounterType === 'trainer',
             testMode: record.testMode,
-        };
+        });
         record.pendingAction = null;
         record.actionResponses.set(actionId, response);
         return response;

@@ -20,6 +20,22 @@ function ticket(testMode = false) {
     }, SECRET);
 }
 
+function battleTicket(opponents, encounterType = 'wild') {
+    return signToken({
+        v: 1,
+        kind: 'battle',
+        aud: 'pokemon-battle-api',
+        sub: 'Player',
+        localBattleId: '11111111-1111-4111-8111-111111111111',
+        encounterType,
+        opponents,
+        players: [pokemon('Pikachu', ['Thunderbolt', 'Quick Attack'])],
+        playerState: {},
+        exp: Math.floor(Date.now() / 1000) + 300,
+        testMode: false,
+    }, SECRET);
+}
+
 function pokemon(species, moves, extras = {}) {
     return {
         species,
@@ -95,6 +111,43 @@ test('wild encounters never call Foul Play', async t => {
         started.state.p1.party[0].moveSlots[0].pp - 1,
     );
     assert.equal(ai.calls.length, 0);
+});
+
+test('signed wild ticket fixes opponent identity and server-owned moves', async t => {
+    const manager = new BattleManager({
+        foulPlayClient: new FakeFoulPlay(),
+        trainerTicketSecret: SECRET,
+    });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'signed-wild-start';
+    input.p1.team = [pokemon('Mewtwo', ['Psystrike'], { level: 100 })];
+    input.p2.team = [pokemon('Pikachu', ['Splash'], { level: 12, ivs: { hp: 0 } })];
+    input.battleTicket = battleTicket([{ species: 'Pikachu', level: 12, shiny: false }]);
+
+    const started = await manager.start(input);
+    const record = manager.getRecord(started.battleId);
+    assert.equal(record.battle.p1.pokemon[0].species.name, 'Pikachu');
+    assert.equal(record.battle.p2.pokemon[0].level, 12);
+    assert.equal(record.battle.p2.pokemon[0].moveSlots.some(move => move.id === 'splash'), false);
+    assert.equal(typeof started.receipt, 'string');
+    const receipt = JSON.parse(Buffer.from(started.receipt.split('.')[0], 'base64url').toString('utf8'));
+    assert.equal(receipt.sub, 'Player');
+    assert.equal(receipt.opponents[0].species, 'Pikachu');
+    assert.deepEqual(receipt.participants, [1]);
+});
+
+test('signed wild ticket rejects a different opponent', async t => {
+    const manager = new BattleManager({
+        foulPlayClient: new FakeFoulPlay(),
+        trainerTicketSecret: SECRET,
+    });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'forged-wild-start';
+    input.p2.team = [pokemon('Mewtwo', ['Splash'], { level: 1 })];
+    input.battleTicket = battleTicket([{ species: 'Caterpie', level: 5 }]);
+    await assert.rejects(manager.start(input), error => error.status === 401);
 });
 
 test('authoritative snapshots carry status and the full bench state', async t => {
