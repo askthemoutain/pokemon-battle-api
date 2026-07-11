@@ -11,11 +11,11 @@ function mon(species, moves, level = 50) {
     return { species, moves, level, nature: 'Serious' };
 }
 
-function bundle(suffix = '1') {
+function bundle(suffix = '1', sharedP1 = '', customTeams = null) {
     const localBattleId = `11111111-1111-4111-8111-${suffix.padStart(12, '0')}`;
-    const participants = { p1: `PlayerA${suffix}`, p2: `PlayerB${suffix}` };
-    const teams = {
-        p1: [mon('Pikachu', ['Tackle'])],
+    const participants = { p1: sharedP1 || `PlayerA${suffix}`, p2: `PlayerB${suffix}` };
+    const teams = customTeams || {
+        p1: [mon('Pikachu', ['Thunder Shock'])],
         p2: [mon('Caterpie', ['Tackle'])],
     };
     const exp = Math.floor(Date.now() / 1000) + 300;
@@ -89,6 +89,124 @@ test('PvP resolves only after both signed sides submit', async t => {
     });
     assert.equal(p1After.state.revision, 2);
     assert.ok(p1After.state.p1.party[0].hp < p1After.state.p1.party[0].maxhp);
+
+    const replayed = await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'p1-turn-1',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal(replayed.replayed, true);
+    assert.equal(replayed.state.revision, 2);
+    assert.equal(replayed.waitingForOpponent, false);
+    assert.match(replayed.log, /\|move\|p1a: Pikachu\|Thunder Shock/);
+
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'p1-turn-2',
+        expectedRevision: 2,
+        action: 'move 1',
+    });
+    const lateReplay = await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'p1-turn-1',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal(lateReplay.replayed, true);
+    assert.equal(lateReplay.resolved, true);
+    assert.equal(lateReplay.state.revision, 2);
+});
+
+test('PvP start retry accepts a freshly signed equivalent ticket after a lost bind', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const data = bundle('35');
+    const first = await start(manager, data, 'lost-bind');
+    const refreshedTicket = signToken({
+        v: 1,
+        kind: 'pvp-battle',
+        aud: 'pokemon-battle-api',
+        localBattleId: data.localBattleId,
+        participants: { p2: data.participants.p2, p1: data.participants.p1 },
+        teams: { p2: data.teams.p2, p1: data.teams.p1 },
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 300,
+        nonce: 'fresh-ticket-nonce',
+    }, SECRET);
+    const replayed = await manager.start({
+        requestId: 'pvp-start-lost-bind',
+        battleTicket: refreshedTicket,
+        sideTicket: data.sideTicket('p1'),
+    });
+
+    assert.equal(replayed.battleId, first.battleId);
+    assert.equal(replayed.localBattleId, data.localBattleId);
+
+    const anotherRequest = await manager.start({
+        requestId: 'pvp-start-lost-bind-new-request',
+        battleTicket: refreshedTicket,
+        sideTicket: data.sideTicket('p1'),
+    });
+    assert.equal(anotherRequest.battleId, first.battleId);
+
+    const conflictingTicket = signToken({
+        v: 1,
+        kind: 'pvp-battle',
+        aud: 'pokemon-battle-api',
+        localBattleId: data.localBattleId,
+        participants: data.participants,
+        teams: { ...data.teams, p1: [mon('Mewtwo', ['Psychic'])] },
+        exp: Math.floor(Date.now() / 1000) + 300,
+    }, SECRET);
+    await assert.rejects(
+        manager.start({
+            requestId: 'pvp-start-lost-bind-conflict',
+            battleTicket: conflictingTicket,
+            sideTicket: data.sideTicket('p1'),
+        }),
+        error => error.status === 409 && /different signed simulation/i.test(error.message),
+    );
+});
+
+test('known action replay returns terminal state and receipt', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const teams = {
+        p1: [mon('Mewtwo', ['Psychic'], 100)],
+        p2: [mon('Caterpie', ['Tackle'], 1)],
+    };
+    const data = bundle('36', '', teams);
+    const started = await start(manager, data, 'terminal-replay');
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'terminal-p1',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    const ended = await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p2'),
+        actionId: 'terminal-p2',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal(ended.state.ended, true);
+
+    const replayed = await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'terminal-p1',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal(replayed.replayed, true);
+    assert.equal(replayed.state.ended, true);
+    assert.equal(typeof replayed.receipt, 'string');
 });
 
 test('PvP rejects wrong side tickets and stale actions', async t => {
@@ -112,6 +230,62 @@ test('PvP rejects wrong side tickets and stale actions', async t => {
         }),
         error => error.status === 409,
     );
+});
+
+test('PvP rejects invalid canonical team data before simulation', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const data = bundle('34');
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const invalidTicket = signToken({
+        v: 1,
+        kind: 'pvp-battle',
+        aud: 'pokemon-battle-api',
+        localBattleId: data.localBattleId,
+        participants: data.participants,
+        teams: {
+            ...data.teams,
+            p1: [mon('Pikachu', ['Definitely Not A Move'])],
+        },
+        exp,
+    }, SECRET);
+
+    await assert.rejects(
+        manager.start({
+            requestId: 'pvp-invalid-team',
+            battleTicket: invalidTicket,
+            sideTicket: data.sideTicket('p1'),
+        }),
+        error => {
+            assert.equal(error.status, 400);
+            assert.match(error.message, /invalid move/i);
+            assert.equal(error.details.code, 'TEAM_INVALID');
+            const rejection = JSON.parse(Buffer.from(error.details.rejectionToken.split('.')[0], 'base64url').toString('utf8'));
+            assert.equal(rejection.kind, 'pvp-rejection');
+            assert.equal(rejection.localBattleId, data.localBattleId);
+            return true;
+        },
+    );
+});
+
+test('competitive PvP rejects illegal learnsets, abilities and EV totals independently', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const cases = [
+        ['37', { species: 'Pikachu', moves: ['Spore'], ability: 'Static', nature: 'Serious', level: 100, evs: { hp: 1 } }, /learn Spore/i],
+        ['38', { species: 'Pikachu', moves: ['Thunder Shock'], ability: 'Wonder Guard', nature: 'Serious', level: 100, evs: { hp: 1 } }, /Wonder Guard/i],
+        ['39', { species: 'Pikachu', moves: ['Thunder Shock'], ability: 'Static', nature: 'Serious', level: 100, evs: { hp: 252, atk: 252, def: 252, spa: 252, spd: 252, spe: 252 } }, /1512 total EVs/i],
+    ];
+
+    for (const [suffix, illegalMon, pattern] of cases) {
+        const data = bundle(suffix, '', { p1: [illegalMon], p2: [mon('Caterpie', ['Tackle'])] });
+        await assert.rejects(
+            start(manager, data, `competitive-invalid-${suffix}`),
+            error => error.status === 400
+                && error.details?.code === 'TEAM_INVALID'
+                && pattern.test(error.message),
+        );
+    }
 });
 
 test('PvP forfeit emits a signed settlement receipt', async t => {
@@ -155,6 +329,16 @@ test('a player can claim a signed win after the opponent turn timeout', async t 
     assert.equal(claimed.state.reason, 'turn-timeout');
     assert.equal(claimed.state.winner, data.participants.p1);
     assert.equal(typeof claimed.receipt, 'string');
+    const replayed = await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'p1-timeout-choice',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal(replayed.replayed, true);
+    assert.equal(replayed.state.reason, 'turn-timeout');
+    assert.equal(typeof replayed.receipt, 'string');
 });
 
 test('polling resolves an abandoned submitted turn without a client claim', async t => {
@@ -214,7 +398,7 @@ test('lost Node state yields signed recovery only after the record disappears', 
 test('three PvP battles progress independently', async t => {
     const manager = new PvpBattleManager({ ticketSecret: SECRET });
     t.after(() => manager.close());
-    const data = ['5', '6', '7'].map(bundle);
+    const data = ['5', '6', '7'].map(suffix => bundle(suffix));
     const started = await Promise.all(data.map((entry, index) => start(manager, entry, String(index + 5))));
     assert.equal(new Set(started.map(entry => entry.battleId)).size, 3);
 
@@ -239,4 +423,35 @@ test('three PvP battles progress independently', async t => {
         sideTicket: data[index].sideTicket('p1'),
     })));
     assert.deepEqual(states.map(entry => entry.state.revision), [2, 2, 2]);
+});
+
+test('one player can progress in three PvP battles independently', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const data = ['31', '32', '33'].map(suffix => bundle(suffix, 'SharedPlayer'));
+    const started = await Promise.all(data.map((entry, index) => start(manager, entry, `shared-${index}`)));
+
+    await Promise.all(started.flatMap((battle, index) => [
+        manager.action({
+            battleId: battle.battleId,
+            sideTicket: data[index].sideTicket('p1'),
+            actionId: `shared-p1-${index}`,
+            expectedRevision: 1,
+            action: 'move 1',
+        }),
+        manager.action({
+            battleId: battle.battleId,
+            sideTicket: data[index].sideTicket('p2'),
+            actionId: `shared-p2-${index}`,
+            expectedRevision: 1,
+            action: 'move 1',
+        }),
+    ]));
+
+    const states = await Promise.all(started.map((battle, index) => manager.state({
+        battleId: battle.battleId,
+        sideTicket: data[index].sideTicket('p1'),
+    })));
+    assert.deepEqual(states.map(entry => entry.state.revision), [2, 2, 2]);
+    assert.deepEqual(states.map(entry => entry.state.p1.name), ['SharedPlayer', 'SharedPlayer', 'SharedPlayer']);
 });

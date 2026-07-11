@@ -142,6 +142,19 @@ export function createPvpRecoveryToken(sideTicket, secret, nowSeconds = Math.flo
     }, secret);
 }
 
+export function createPvpRejectionToken(ticket, secret, reason, nowSeconds = Math.floor(Date.now() / 1000)) {
+    return signToken({
+        v: 1,
+        kind: 'pvp-rejection',
+        aud: 'pokemon-covenant-php',
+        localBattleId: ticket.localBattleId,
+        participants: ticket.participants,
+        reason: String(reason || 'team-invalid').slice(0, 500),
+        iat: nowSeconds,
+        exp: nowSeconds + 5 * 60,
+    }, secret);
+}
+
 export function createBattleReceipt(record, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
     const state = record.publicState;
     const opponents = record.battle.p2.pokemon.map((pokemon, index) => ({

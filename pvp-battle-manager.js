@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
-import { Battle, extractChannelMessages } from '@pkmn/sim';
+import { Battle, Dex, TeamValidator, extractChannelMessages } from '@pkmn/sim';
 
 import {
     createPvpReceipt,
+    createPvpRejectionToken,
     createPvpRecoveryToken,
     verifyPvpBattleTicket,
     verifyPvpSideTicket,
@@ -12,7 +13,16 @@ import {
 const twoHours = 2 * 60 * 60 * 1000;
 const turnTimeout = 3 * 60 * 1000;
 const idleMatchTimeout = 30 * 60 * 1000;
+const pvpFormat = 'gen9nationaldexag';
 const clone = value => JSON.parse(JSON.stringify(value));
+
+function canonicalJson(value) {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+}
 
 export class PvpInputError extends Error {
     constructor(message, status = 400, details = null) {
@@ -27,13 +37,31 @@ function safeTeam(team) {
     if (!Array.isArray(team) || !team.length || team.length > 6) {
         throw new PvpInputError('A valid PvP team is required.');
     }
-    return team.map(mon => ({
-        ...mon,
-        moves: Array.isArray(mon.moves) && mon.moves.length
-            ? mon.moves.slice(0, 4).map(move => typeof move === 'string' ? move : move?.name || 'Tackle')
-            : ['Tackle'],
-        level: Math.max(1, Math.min(100, Number(mon.level) || 50)),
-    }));
+    const normalized = team.map(mon => {
+        const level = Math.max(1, Math.min(100, Number(mon.level) || 50));
+        const species = Dex.species.get(mon.species);
+        const evs = Object.fromEntries(Object.entries(mon.evs || {}).map(([stat, value]) => [stat, Number(value) || 0]));
+        const evTotal = Object.values(evs).reduce((sum, value) => sum + value, 0);
+        if (evTotal <= 510 && (evTotal === 0 || level !== 100) && !Object.values(evs).some(value => value % 4 !== 0)) {
+            const marker = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'].find(stat => Number(evs[stat] || 0) < 252) || 'hp';
+            evs[marker] = Number(evs[marker] || 0) + 1;
+        }
+        return {
+            ...mon,
+            name: String(mon.name || mon.species || '').slice(0, 18),
+            ability: !mon.ability || mon.ability === '???' ? (species.abilities?.[0] || '') : mon.ability,
+            moves: Array.isArray(mon.moves) && mon.moves.length
+                ? mon.moves.slice(0, 4).map(move => typeof move === 'string' ? move : move?.name || '')
+                : [],
+            level,
+            evs,
+        };
+    });
+    const problems = TeamValidator.get(pvpFormat).validateTeam(clone(normalized));
+    if (problems?.length) {
+        throw new PvpInputError(`Invalid PvP team: ${problems[0]}`);
+    }
+    return normalized;
 }
 
 function sideLog(rawLog, channel) {
@@ -179,6 +207,7 @@ export class PvpBattleManager {
         this.now = now;
         this.records = new Map();
         this.startRequests = new Map();
+        this.localStarts = new Map();
         this.cleanupTimer = setInterval(() => this.cleanup(), 15 * 60 * 1000);
         this.cleanupTimer.unref?.();
     }
@@ -190,7 +219,10 @@ export class PvpBattleManager {
     cleanup() {
         const cutoff = this.now() - twoHours;
         for (const [battleId, record] of this.records) {
-            if (record.lastAccess < cutoff) this.records.delete(battleId);
+            if (record.lastAccess < cutoff) {
+                this.records.delete(battleId);
+                this.localStarts.delete(record.localBattleId);
+            }
         }
         for (const [requestId, entry] of this.startRequests) {
             if (entry.createdAt < cutoff) this.startRequests.delete(requestId);
@@ -281,16 +313,41 @@ export class PvpBattleManager {
         }
         const requestId = String(payload.requestId || '');
         if (!requestId || requestId.length > 100) throw new PvpInputError('A valid requestId is required.');
-        const fingerprint = crypto.createHash('sha256').update(payload.battleTicket).digest('hex');
+        const fingerprint = crypto.createHash('sha256').update(canonicalJson({
+            localBattleId: ticket.localBattleId,
+            participants: ticket.participants,
+            teams: ticket.teams,
+        })).digest('hex');
         const existing = this.startRequests.get(requestId);
         if (existing && existing.fingerprint !== fingerprint) {
             throw new PvpInputError('requestId was reused with a different PvP battle.', 409);
         }
         if (existing) return this._response(existing.record, 'p1');
 
-        const battle = new Battle({ formatid: 'gen9customgame', strictChoices: false });
-        battle.setPlayer('p1', { name: ticket.participants.p1, team: safeTeam(ticket.teams.p1) });
-        battle.setPlayer('p2', { name: ticket.participants.p2, team: safeTeam(ticket.teams.p2) });
+        const localExisting = this.localStarts.get(ticket.localBattleId);
+        if (localExisting && localExisting.fingerprint !== fingerprint) {
+            throw new PvpInputError('This escrow battle already has a different signed simulation.', 409);
+        }
+        if (localExisting) {
+            this.startRequests.set(requestId, localExisting);
+            return this._response(localExisting.record, 'p1');
+        }
+
+        let p1Team;
+        let p2Team;
+        try {
+            p1Team = safeTeam(ticket.teams.p1);
+            p2Team = safeTeam(ticket.teams.p2);
+        } catch (error) {
+            if (!(error instanceof PvpInputError)) throw error;
+            throw new PvpInputError(error.message, 400, {
+                code: 'TEAM_INVALID',
+                rejectionToken: createPvpRejectionToken(ticket, this.ticketSecret, error.message, Math.floor(this.now() / 1000)),
+            });
+        }
+        const battle = new Battle({ formatid: pvpFormat, strictChoices: false });
+        battle.setPlayer('p1', { name: ticket.participants.p1, team: p1Team });
+        battle.setPlayer('p2', { name: ticket.participants.p2, team: p2Team });
         battle.p1.pokemon.forEach((pokemon, index) => { pokemon.clientSlot = index + 1; });
         battle.p2.pokemon.forEach((pokemon, index) => { pokemon.clientSlot = index + 1; });
         if (!battle.choose('p1', 'team 1') || !battle.choose('p2', 'team 1')) {
@@ -315,7 +372,9 @@ export class PvpBattleManager {
         };
         this._drainLogs(record);
         this.records.set(record.battleId, record);
-        this.startRequests.set(requestId, { record, fingerprint, createdAt: now });
+        const startEntry = { record, fingerprint, createdAt: now };
+        this.startRequests.set(requestId, startEntry);
+        this.localStarts.set(record.localBattleId, startEntry);
         return this._response(record, 'p1');
     }
 
@@ -331,10 +390,9 @@ export class PvpBattleManager {
     async action(payload) {
         const record = this.records.get(payload?.battleId);
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
-        this._endByClock(record);
-        if (record.battle.ended || record.endedReason) throw new PvpInputError('PvP battle already ended.', 409);
         const sideTicket = this._verifySide(record, payload.sideTicket);
         const side = sideTicket.side;
+        this._endByClock(record);
         const actionId = String(payload.actionId || '');
         if (!actionId || actionId.length > 100) throw new PvpInputError('A valid actionId is required.');
         const key = `${side}:${actionId}`;
@@ -342,7 +400,16 @@ export class PvpBattleManager {
         if (record.actionFingerprints.has(key) && record.actionFingerprints.get(key) !== fingerprint) {
             throw new PvpInputError('actionId was reused with another PvP action.', 409);
         }
-        if (record.actionResponses.has(key)) return record.actionResponses.get(key);
+        if (record.actionResponses.has(key)) {
+            const cached = record.actionResponses.get(key);
+            return this._response(record, side, {
+                accepted: true,
+                replayed: true,
+                resolved: Boolean(cached?.resolved)
+                    || record.revision > Number(cached?.state?.revision || 0),
+            });
+        }
+        if (record.battle.ended || record.endedReason) throw new PvpInputError('PvP battle already ended.', 409);
         if (Number(payload.expectedRevision) !== record.revision) {
             throw new PvpInputError('PvP state is stale.', 409, { state: currentState(record, side) });
         }
