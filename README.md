@@ -10,7 +10,7 @@ lead, move, and forced switch to the separate Foul Play HTTP service.
 - `TRAINER_TICKET_SECRET` verifies short-lived tickets issued by GDRCD PHP.
 - `FOUL_PLAY_URL` is the Foul Play service origin, without a trailing slash.
 - `FOUL_PLAY_SHARED_SECRET` signs Node-to-Foul-Play request bodies.
-- `FOUL_PLAY_TIMEOUT_MS=15000` bounds one HTTP attempt on the free service.
+- `FOUL_PLAY_TIMEOUT_MS=60000` allows a free-tier cold start plus one search.
 - `FOUL_PLAY_SEARCH_BUDGET_MS=2000` is clamped to 100-2000 ms.
 - `TRAINER_AI_ABORT_AFTER_MS=120000` controls signed safe recovery.
 - `ALLOWED_ORIGINS` is the comma-separated browser origin allowlist.

@@ -14,7 +14,7 @@ export class FoulPlayClient {
     constructor({
         url = process.env.FOUL_PLAY_URL || '',
         secret = process.env.FOUL_PLAY_SHARED_SECRET || '',
-        timeoutMs = Number(process.env.FOUL_PLAY_TIMEOUT_MS || 15000),
+        timeoutMs = Number(process.env.FOUL_PLAY_TIMEOUT_MS || 60000),
         fetchImpl = globalThis.fetch,
     } = {}) {
         this.url = url.replace(/\/$/, '');
