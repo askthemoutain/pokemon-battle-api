@@ -108,6 +108,22 @@ export function verifyPvpSideTicket(token, secret, nowSeconds = Math.floor(Date.
     return payload;
 }
 
+export function verifyPvpSpectatorTicket(token, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+    const payload = verifySignedToken(token, secret);
+    if (
+        payload.v !== 1 ||
+        payload.kind !== 'pvp-spectator' ||
+        payload.aud !== 'pokemon-battle-api' ||
+        !payload.localBattleId ||
+        !payload.battleId ||
+        !payload.sub ||
+        !assertFresh(payload, nowSeconds)
+    ) {
+        throw new Error('PvP spectator ticket is expired or invalid.');
+    }
+    return payload;
+}
+
 export function createPvpReceipt(record, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
     return signToken({
         v: 1,

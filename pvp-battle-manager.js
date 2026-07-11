@@ -7,12 +7,15 @@ import {
     createPvpRecoveryToken,
     verifyPvpBattleTicket,
     verifyPvpSideTicket,
+    verifyPvpSpectatorTicket,
 } from './tokens.js';
 
 
 const twoHours = 2 * 60 * 60 * 1000;
 const turnTimeout = 3 * 60 * 1000;
 const idleMatchTimeout = 30 * 60 * 1000;
+const spectatorDelay = 10 * 1000;
+const spectatorHistoryLimit = 40;
 const pvpFormat = 'gen9nationaldexag';
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -198,6 +201,26 @@ function currentState(record, perspective) {
     };
 }
 
+function spectatorState(record) {
+    const ended = Boolean(record.endedReason || record.battle.ended);
+    return {
+        schemaVersion: 3,
+        revision: record.revision,
+        turn: record.battle.turn,
+        phase: ended ? 'ended' : 'watching',
+        canAct: false,
+        perspective: 'spectator',
+        request: { forceSwitch: false, wait: true, trapped: false },
+        p1: snapshotSide(record.battle.p1, null, false),
+        p2: snapshotSide(record.battle.p2, null, false),
+        pendingSides: [],
+        pendingSince: {},
+        ended,
+        winner: record.battle.winner || '',
+        reason: record.endedReason || '',
+    };
+}
+
 export class PvpBattleManager {
     constructor({
         ticketSecret = process.env.TRAINER_TICKET_SECRET || '',
@@ -246,6 +269,19 @@ export class PvpBattleManager {
         return ticket;
     }
 
+    _verifySpectator(record, token) {
+        let ticket;
+        try {
+            ticket = verifyPvpSpectatorTicket(token, this.ticketSecret, Math.floor(this.now() / 1000));
+        } catch (error) {
+            throw new PvpInputError(error.message, 401);
+        }
+        if (ticket.localBattleId !== record.localBattleId || ticket.battleId !== record.battleId) {
+            throw new PvpInputError('PvP spectator ticket does not match this battle.', 401);
+        }
+        return ticket;
+    }
+
     _drainLogs(record) {
         const raw = record.battle.log.join('\n');
         record.battle.log = [];
@@ -253,6 +289,43 @@ export class PvpBattleManager {
             const visible = sideLog(raw, side === 'p1' ? 1 : 2);
             if (visible) record.logs[side].push(...visible.split('\n').filter(Boolean));
         }
+        const publicLog = sideLog(raw, 0);
+        if (publicLog) record.logs.spectator.push(...publicLog.split('\n').filter(Boolean));
+    }
+
+    _appendPublicEvent(record, line) {
+        record.logs.p1.push(line);
+        record.logs.p2.push(line);
+        record.logs.spectator.push(line);
+    }
+
+    _captureSpectator(record) {
+        const snapshot = {
+            capturedAt: this.now(),
+            state: clone(spectatorState(record)),
+            log: record.logs.spectator.join('\n'),
+        };
+        const previous = record.spectatorHistory.at(-1);
+        if (previous?.state?.revision === snapshot.state.revision && previous.log === snapshot.log) return;
+        record.spectatorHistory.push(snapshot);
+        if (record.spectatorHistory.length > spectatorHistoryLimit) {
+            // Preserve the initial state so a burst of turns can never bypass the delay.
+            record.spectatorHistory.splice(1, 1);
+        }
+    }
+
+    _spectatorResponse(record) {
+        const cutoff = this.now() - spectatorDelay;
+        const eligible = record.spectatorHistory.filter(entry => entry.capturedAt <= cutoff);
+        const snapshot = eligible.at(-1) || record.spectatorHistory[0];
+        return {
+            success: true,
+            battleId: record.battleId,
+            localBattleId: record.localBattleId,
+            delayedByMs: spectatorDelay,
+            state: clone(snapshot.state),
+            log: snapshot.log,
+        };
     }
 
     _endByClock(record) {
@@ -265,16 +338,16 @@ export class PvpBattleManager {
             record.battle.winner = record.participants[winnerSide];
             record.revision++;
             record.pendingChoices = {};
-            record.logs.p1.push(`|covenant|timeout|${loserSide}`);
-            record.logs.p2.push(`|covenant|timeout|${loserSide}`);
+            this._appendPublicEvent(record, `|covenant|timeout|${loserSide}`);
+            this._captureSpectator(record);
             return;
         }
         if (pending.length === 0 && this.now() - record.lastProgressAt >= idleMatchTimeout) {
             record.endedReason = 'idle-timeout';
             record.battle.winner = '';
             record.revision++;
-            record.logs.p1.push('|covenant|idle-timeout|draw');
-            record.logs.p2.push('|covenant|idle-timeout|draw');
+            this._appendPublicEvent(record, '|covenant|idle-timeout|draw');
+            this._captureSpectator(record);
         }
     }
 
@@ -367,10 +440,12 @@ export class PvpBattleManager {
             pendingChoices: {},
             actionFingerprints: new Map(),
             actionResponses: new Map(),
-            logs: { p1: [], p2: [] },
+            logs: { p1: [], p2: [], spectator: [] },
+            spectatorHistory: [],
             endedReason: '',
         };
         this._drainLogs(record);
+        this._captureSpectator(record);
         this.records.set(record.battleId, record);
         const startEntry = { record, fingerprint, createdAt: now };
         this.startRequests.set(requestId, startEntry);
@@ -385,6 +460,15 @@ export class PvpBattleManager {
         record.lastAccess = this.now();
         this._endByClock(record);
         return this._response(record, sideTicket.side);
+    }
+
+    async spectate(payload) {
+        const record = this.records.get(payload?.battleId);
+        if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
+        this._verifySpectator(record, payload.spectatorTicket);
+        record.lastAccess = this.now();
+        this._endByClock(record);
+        return this._spectatorResponse(record);
     }
 
     async action(payload) {
@@ -445,6 +529,7 @@ export class PvpBattleManager {
         record.lastAccess = this.now();
         record.lastProgressAt = this.now();
         this._drainLogs(record);
+        this._captureSpectator(record);
         const response = this._response(record, side, { accepted: true, resolved: true });
         record.actionResponses.set(key, response);
         return response;
@@ -460,8 +545,8 @@ export class PvpBattleManager {
             record.endedReason = 'forfeit';
             record.battle.winner = record.participants[winnerSide];
             record.revision++;
-            record.logs.p1.push(`|covenant|forfeit|${sideTicket.side}`);
-            record.logs.p2.push(`|covenant|forfeit|${sideTicket.side}`);
+            this._appendPublicEvent(record, `|covenant|forfeit|${sideTicket.side}`);
+            this._captureSpectator(record);
         }
         return this._response(record, sideTicket.side, { forfeited: true });
     }
@@ -486,8 +571,8 @@ export class PvpBattleManager {
         record.battle.winner = record.participants[sideTicket.side];
         record.revision++;
         record.pendingChoices = {};
-        record.logs.p1.push(`|covenant|timeout|${opponentSide}`);
-        record.logs.p2.push(`|covenant|timeout|${opponentSide}`);
+        this._appendPublicEvent(record, `|covenant|timeout|${opponentSide}`);
+        this._captureSpectator(record);
         return this._response(record, sideTicket.side, { timeoutClaimed: true });
     }
 

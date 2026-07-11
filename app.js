@@ -79,6 +79,7 @@ export function createApp(manager, pvpManager = null) {
         app.post('/api/pvp/start', verifySignature, handle(body => pvpManager.start(body)));
         app.post('/api/pvp/action', verifySignature, handle(body => pvpManager.action(body)));
         app.post('/api/pvp/state', verifySignature, handle(body => pvpManager.state(body)));
+        app.post('/api/pvp/spectate', verifySignature, handle(body => pvpManager.spectate(body)));
         app.post('/api/pvp/forfeit', verifySignature, handle(body => pvpManager.forfeit(body)));
         app.post('/api/pvp/timeout', verifySignature, handle(body => pvpManager.claimTimeout(body)));
         app.post('/api/pvp/recover', verifySignature, handle(body => pvpManager.recover(body)));

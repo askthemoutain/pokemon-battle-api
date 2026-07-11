@@ -40,6 +40,18 @@ function bundle(suffix = '1', sharedP1 = '', customTeams = null) {
     return { localBattleId, participants, teams, battleTicket, sideTicket };
 }
 
+function spectatorTicket(data, battleId, viewer = 'Watcher') {
+    return signToken({
+        v: 1,
+        kind: 'pvp-spectator',
+        aud: 'pokemon-battle-api',
+        localBattleId: data.localBattleId,
+        battleId,
+        sub: viewer,
+        exp: Math.floor(Date.now() / 1000) + (2 * 60 * 60),
+    }, SECRET);
+}
+
 async function start(manager, data, suffix = '1') {
     return manager.start({
         requestId: `pvp-start-${suffix}`,
@@ -119,6 +131,74 @@ test('PvP resolves only after both signed sides submit', async t => {
     assert.equal(lateReplay.replayed, true);
     assert.equal(lateReplay.resolved, true);
     assert.equal(lateReplay.state.revision, 2);
+});
+
+test('spectators receive delayed public state without either side private data', async t => {
+    let now = Date.now();
+    const manager = new PvpBattleManager({ ticketSecret: SECRET, now: () => now });
+    t.after(() => manager.close());
+    const data = bundle('40');
+    const started = await start(manager, data, 'spectator-delay');
+    const ticket = spectatorTicket(data, started.battleId);
+
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'spectator-p1',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p2'),
+        actionId: 'spectator-p2',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+
+    const delayed = await manager.spectate({ battleId: started.battleId, spectatorTicket: ticket });
+    assert.equal(delayed.delayedByMs, 10000);
+    assert.equal(delayed.state.revision, 1);
+    assert.equal(delayed.state.perspective, 'spectator');
+    assert.equal(delayed.state.canAct, false);
+    assert.deepEqual(delayed.state.pendingSides, []);
+    assert.equal(delayed.receipt, undefined);
+
+    now += 10001;
+    const publicTurn = await manager.spectate({ battleId: started.battleId, spectatorTicket: ticket });
+    assert.equal(publicTurn.state.revision, 2);
+    assert.match(publicTurn.log, /\|move\|p1a: Pikachu\|Thunder Shock/);
+    for (const side of ['p1', 'p2']) {
+        const visible = publicTurn.state[side].party[0];
+        assert.equal(visible.moveSlots, undefined);
+        assert.equal(visible.item, undefined);
+        assert.equal(visible.ability, undefined);
+    }
+});
+
+test('spectator tickets are battle-bound and cannot act as side tickets', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const data = bundle('41');
+    const other = bundle('42');
+    const started = await start(manager, data, 'spectator-scope');
+    const wrong = spectatorTicket(other, started.battleId);
+    const ticket = spectatorTicket(data, started.battleId);
+
+    await assert.rejects(
+        manager.spectate({ battleId: started.battleId, spectatorTicket: wrong }),
+        error => error.status === 401,
+    );
+    await assert.rejects(
+        manager.action({
+            battleId: started.battleId,
+            sideTicket: ticket,
+            actionId: 'spectator-cannot-act',
+            expectedRevision: 1,
+            action: 'move 1',
+        }),
+        error => error.status === 401,
+    );
 });
 
 test('PvP start retry accepts a freshly signed equivalent ticket after a lost bind', async t => {
