@@ -280,6 +280,11 @@ test('overlapping trainer action IDs cannot start parallel AI searches', async t
         expectedRevision: 1,
         action: 'move 1',
     });
+    const resolving = await manager.state({ battleId: started.battleId });
+    assert.deepEqual(resolving.state.command, {
+        phase: 'resolving',
+        actionId: 'parallel-action-1',
+    });
     await assert.rejects(
         manager.action({
             battleId: started.battleId,
@@ -293,6 +298,7 @@ test('overlapping trainer action IDs cannot start parallel AI searches', async t
     const response = await first;
 
     assert.equal(response.state.revision, 2);
+    assert.deepEqual(response.state.command, { phase: 'idle', actionId: '' });
     assert.deepEqual(calls, ['team', 'move']);
 });
 

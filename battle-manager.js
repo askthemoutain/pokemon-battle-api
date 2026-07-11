@@ -205,6 +205,16 @@ function currentState(record) {
             wait: Boolean(request?.wait),
             trapped: Boolean(request?.active?.[0]?.trapped),
         },
+        command: {
+            phase: ended
+                ? 'idle'
+                : record.resolvingActionId
+                ? 'resolving'
+                : record.pendingAction
+                    ? 'pending'
+                    : 'idle',
+            actionId: ended ? '' : (record.resolvingActionId || record.pendingAction?.actionId || ''),
+        },
         p1,
         p2,
         // Compatibility aliases for clients deployed before schema v2.
@@ -766,6 +776,8 @@ export class BattleManager {
         if (activePlayer?.clientSlot) record.participatedSlots.add(activePlayer.clientSlot);
         const battleLog = this._drainLogs(record);
         const log = [pending.specialLog, battleLog].filter(Boolean).join('\n');
+        record.pendingAction = null;
+        record.resolvingActionId = null;
         record.revision++;
         const response = this._withReceipt(record, {
             success: true,
@@ -775,7 +787,6 @@ export class BattleManager {
             trainer: record.encounterType === 'trainer',
             testMode: record.testMode,
         });
-        record.pendingAction = null;
         record.actionResponses.set(actionId, response);
         return response;
     }
