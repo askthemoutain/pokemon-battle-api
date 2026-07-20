@@ -86,6 +86,7 @@ export function createApp(manager, pvpManager = null) {
     }
     app.get('/api/health', (req, res) => res.json({
         ok: true,
+        revision: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || '',
         trainerAiEnabled: manager.trainerAiEnabled,
         foulPlayConfigured: Boolean(manager.foulPlayClient?.configured),
         activeBattles: manager.records.size,
