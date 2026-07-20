@@ -76,6 +76,10 @@ function conditionIsFainted(condition = '') {
     return condition.includes('fnt') || condition.startsWith('0 ');
 }
 
+function isRevivalRequest(request) {
+    return Boolean(request?.forceSwitch && request.side?.pokemon?.some(pokemon => pokemon.active && pokemon.reviving));
+}
+
 function normalizeAction(action, side) {
     const match = typeof action === 'string' && action.trim().match(/^switch\s+(\d+)$/i);
     if (!match) return action;
@@ -96,7 +100,15 @@ function assertLegalChoice(action, request) {
     const pokemon = request.side?.pokemon || [];
     if (kind === 'switch') {
         const target = pokemon[index - 1];
-        if (!Number.isInteger(index) || !target || target.active || conditionIsFainted(target.condition)) {
+        const fainted = conditionIsFainted(target?.condition);
+        const reviving = isRevivalRequest(request);
+        if (
+            !Number.isInteger(index) ||
+            !target ||
+            target.active ||
+            (reviving ? !fainted : fainted) ||
+            (!request.forceSwitch && request.active?.[0]?.trapped)
+        ) {
             throw new PvpInputError('Invalid switch target.');
         }
         return;
@@ -118,38 +130,54 @@ function publicVolatiles(pokemon) {
     }));
 }
 
+function publicConditions(conditions) {
+    return Object.fromEntries(Object.keys(conditions || {}).map(id => [id, {}]));
+}
+
 function snapshotPokemon(pokemon, side, revealPrivate, requestMoves = null) {
     const slotIndex = side.pokemon.indexOf(pokemon);
+    const apparent = pokemon.illusion || pokemon;
+    const apparentSpecies = apparent.species?.name || pokemon.species.name;
+    const apparentName = apparent.name || apparentSpecies;
+    const apparentDetails = apparent.details || pokemon.details;
+    const identPrefix = String(pokemon.ident || '').split(':', 1)[0] || side.id;
     const snapshot = {
         slot: pokemon.clientSlot ?? slotIndex + 1,
-        name: pokemon.name,
-        species: pokemon.species.name,
-        ident: pokemon.ident,
-        details: pokemon.details,
-        level: pokemon.level,
-        gender: pokemon.gender,
+        name: revealPrivate ? pokemon.name : apparentName,
+        species: revealPrivate ? pokemon.species.name : apparentSpecies,
+        renderSpecies: apparentSpecies,
+        ident: revealPrivate ? pokemon.ident : `${identPrefix}: ${apparentName}`,
+        details: revealPrivate ? pokemon.details : apparentDetails,
+        level: revealPrivate ? pokemon.level : apparent.level,
+        gender: revealPrivate ? pokemon.gender : apparent.gender,
         hp: pokemon.hp,
         maxhp: pokemon.maxhp,
         status: pokemon.status || '',
         fainted: Boolean(pokemon.fainted),
         active: side.active.includes(pokemon),
-        types: [...(pokemon.types || [])],
+        types: [...((revealPrivate ? pokemon.types : apparent.types) || [])],
         boosts: { ...(pokemon.boosts || {}) },
         volatiles: publicVolatiles(pokemon),
     };
     if (!revealPrivate) return snapshot;
-    const requested = new Map((requestMoves || []).map(move => [move.id, move]));
     snapshot.item = pokemon.item || '';
     snapshot.ability = pokemon.ability || '';
-    snapshot.moveSlots = (pokemon.moveSlots || []).map((move, index) => ({
-        move: requested.get(move.id)?.move || move.move,
-        id: move.id,
-        pp: requested.get(move.id)?.pp ?? move.pp,
-        maxpp: requested.get(move.id)?.maxpp ?? move.maxpp,
-        target: requested.get(move.id)?.target || move.target,
-        disabled: Boolean(requested.get(move.id)?.disabled ?? move.disabled),
-        index: index + 1,
-    }));
+    const sourceMoves = pokemon.moveSlots || [];
+    const visibleMoves = Array.isArray(requestMoves) ? requestMoves : sourceMoves;
+    snapshot.moveSlots = visibleMoves.map((move, index) => {
+        const source = sourceMoves.find(candidate => candidate.id === move.id)
+            || (Array.isArray(requestMoves) ? {} : sourceMoves[index])
+            || {};
+        return {
+            move: move.move || source.move,
+            id: move.id || source.id,
+            pp: move.pp ?? source.pp,
+            maxpp: move.maxpp ?? source.maxpp,
+            target: move.target || source.target,
+            disabled: Boolean(move.disabled ?? source.disabled),
+            index: index + 1,
+        };
+    });
     return snapshot;
 }
 
@@ -162,6 +190,8 @@ function snapshotSide(side, request, revealPrivate) {
     return {
         name: side.name,
         activeSlot: active?.clientSlot || null,
+        sideConditions: publicConditions(side.sideConditions),
+        slotConditions: publicConditions(side.slotConditions?.[active?.position || 0]),
         party,
     };
 }
@@ -177,6 +207,14 @@ function currentState(record, perspective) {
             : (!request || request.wait)
                 ? 'waiting'
                 : 'move';
+    const requestPokemon = request?.side?.pokemon || [];
+    const reviving = Boolean(request?.forceSwitch && requestPokemon.some(pokemon => pokemon.active && pokemon.reviving));
+    const forcedMove = Boolean(
+        !request?.forceSwitch &&
+        request?.active?.[0]?.moves?.length === 1 &&
+        side.active[0]?.getLockedMove?.()
+    );
+    const trapped = Boolean(request?.active?.[0]?.trapped);
     return {
         schemaVersion: 3,
         revision: record.revision,
@@ -187,10 +225,20 @@ function currentState(record, perspective) {
         request: {
             forceSwitch: Boolean(request?.forceSwitch),
             wait: Boolean(request?.wait),
-            trapped: Boolean(request?.active?.[0]?.trapped),
+            trapped,
+            reviving,
+            forcedMove,
+            canSwitch: Boolean(request && !request.wait && (request.forceSwitch || !trapped) && !forcedMove),
+            canUseBag: false,
+            canRun: !ended,
         },
         p1: snapshotSide(record.battle.p1, record.battle.p1.activeRequest, perspective === 'p1'),
         p2: snapshotSide(record.battle.p2, record.battle.p2.activeRequest, perspective === 'p2'),
+        field: {
+            weather: record.battle.field.weather || '',
+            terrain: record.battle.field.terrain || '',
+            pseudoWeather: publicConditions(record.battle.field.pseudoWeather),
+        },
         pendingSides: Object.keys(record.pendingChoices),
         pendingSince: Object.fromEntries(Object.entries(record.pendingChoices)
             .map(([pendingSide, choice]) => [pendingSide, choice.submittedAt])),

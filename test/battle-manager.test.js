@@ -546,3 +546,114 @@ test('trainer forced switch is resolved by Foul Play and action retry is idempot
     assert.deepEqual(duplicate, first);
     assert.deepEqual(ai.calls.map(call => call.requestType), ['team', 'move', 'switch']);
 });
+
+test('persisted PP are restored by slot without changing the legal move order', async t => {
+    const manager = new BattleManager({ foulPlayClient: new FakeFoulPlay() });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'restore-pp-start';
+    input.p1.team = [pokemon('Pikachu', ['Thunderbolt', 'Quick Attack'])];
+    input.p2.team = [pokemon('Blissey', ['Splash'])];
+    input.p1State = {
+        __slots: {
+            1: { hp: 100, status: '', moves: { thunderbolt: 2, quickattack: 1 } },
+        },
+    };
+
+    const started = await manager.start(input);
+    assert.deepEqual(
+        started.state.p1.party[0].moveSlots.map(move => [move.id, move.pp]),
+        [['thunderbolt', 2], ['quickattack', 1]],
+    );
+});
+
+test('two-turn and recharge phases continue automatically from one player choice', async t => {
+    const manager = new BattleManager({ foulPlayClient: new FakeFoulPlay() });
+    t.after(() => manager.close());
+
+    const flyInput = payload('wild');
+    flyInput.requestId = 'forced-fly-start';
+    flyInput.p1.team = [pokemon('Caterpie', ['Fly', 'Tackle'], { level: 1 })];
+    flyInput.p2.team = [pokemon('Blissey', ['Splash'], { level: 100 })];
+    const flyStart = await manager.start(flyInput);
+    const flew = await manager.action({
+        battleId: flyStart.battleId,
+        actionId: 'forced-fly-action',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal((flew.log.match(/\|move\|p1a: Caterpie\|Fly/g) || []).length, 2);
+    assert.equal(flew.state.request.forcedMove, false);
+    assert.deepEqual(flew.state.p1.party[0].moveSlots.map(move => move.id), ['fly', 'tackle']);
+
+    const rechargeInput = payload('wild');
+    rechargeInput.requestId = 'forced-recharge-start';
+    rechargeInput.p1.team = [pokemon('Caterpie', ['Hyper Beam', 'Tackle'], { level: 1 })];
+    rechargeInput.p2.team = [pokemon('Blissey', ['Splash'], { level: 100 })];
+    const rechargeStart = await manager.start(rechargeInput);
+    const recharged = await manager.action({
+        battleId: rechargeStart.battleId,
+        actionId: 'forced-recharge-action',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.match(recharged.log, /\|cant\|p1a: Caterpie\|recharge/);
+    assert.equal(recharged.state.request.forcedMove, false);
+});
+
+test('Revival Blessing enables only the fainted target and revives it', async t => {
+    const manager = new BattleManager({ foulPlayClient: new FakeFoulPlay() });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'revival-blessing-start';
+    input.p1.team = [
+        pokemon('Pikachu', ['Revival Blessing'], { level: 100 }),
+        pokemon('Caterpie', ['Splash'], { level: 1 }),
+    ];
+    input.p2.team = [pokemon('Blissey', ['Splash'], { level: 1 })];
+    input.p1State = { __slots: { 2: { hp: 0, status: 'fnt' } } };
+
+    const started = await manager.start(input);
+    const blessing = await manager.action({
+        battleId: started.battleId,
+        actionId: 'revival-use',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.equal(blessing.state.request.forceSwitch, true);
+    assert.equal(blessing.state.request.reviving, true);
+    await assert.rejects(
+        manager.action({
+            battleId: started.battleId,
+            actionId: 'revival-invalid',
+            expectedRevision: blessing.state.revision,
+            action: 'switch 1',
+        }),
+        error => error.status === 400,
+    );
+    const revived = await manager.action({
+        battleId: started.battleId,
+        actionId: 'revival-target',
+        expectedRevision: blessing.state.revision,
+        action: 'switch 2',
+    });
+    assert.equal(revived.state.p1.party[1].fainted, false);
+    assert.ok(revived.state.p1.party[1].hp > 0);
+});
+
+test('public snapshots preserve Illusion while private snapshots retain identity', async t => {
+    const manager = new BattleManager({ foulPlayClient: new FakeFoulPlay() });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'illusion-snapshot-start';
+    input.p1.team = [pokemon('Pikachu', ['Splash'])];
+    input.p2.team = [
+        pokemon('Zoroark', ['Night Daze'], { ability: 'Illusion' }),
+        pokemon('Blissey', ['Splash']),
+    ];
+    const started = await manager.start(input);
+    assert.equal(started.state.p2.party[0].species, 'Blissey');
+    assert.equal(started.state.p2.party[0].renderSpecies, 'Blissey');
+    assert.doesNotMatch(started.state.p2.party[0].ident, /Zoroark/);
+    assert.equal(manager.getRecord(started.battleId).battle.p2.active[0].species.name, 'Zoroark');
+});

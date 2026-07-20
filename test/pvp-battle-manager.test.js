@@ -535,3 +535,35 @@ test('one player can progress in three PvP battles independently', async t => {
     assert.deepEqual(states.map(entry => entry.state.revision), [2, 2, 2]);
     assert.deepEqual(states.map(entry => entry.state.p1.name), ['SharedPlayer', 'SharedPlayer', 'SharedPlayer']);
 });
+
+test('PvP exposes only the locked continuation move after Fly preparation', async t => {
+    const manager = new PvpBattleManager({ ticketSecret: SECRET });
+    t.after(() => manager.close());
+    const data = bundle('43', '', {
+        p1: [mon('Dragonite', ['Fly', 'Extreme Speed'], 50)],
+        p2: [mon('Blissey', ['Soft-Boiled'], 50)],
+    });
+    const started = await start(manager, data, 'locked-fly');
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'locked-fly-p1',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p2'),
+        actionId: 'locked-fly-p2',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    const state = await manager.state({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+    });
+    assert.equal(state.state.request.forcedMove, true);
+    assert.equal(state.state.request.canSwitch, false);
+    assert.deepEqual(state.state.p1.party[0].moveSlots.map(move => move.id), ['fly']);
+    assert.equal(state.state.p1.party[0].moveSlots[0].index, 1);
+});

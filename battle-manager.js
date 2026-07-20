@@ -112,6 +112,16 @@ function applyP1State(battle, p1State) {
             if (mon.hp === 0) mon.faint();
         }
         if (state.status && !persistedFainted) mon.setStatus(state.status);
+
+        if (state.moves && typeof state.moves === 'object') {
+            for (const slots of [mon.moveSlots, mon.baseMoveSlots]) {
+                for (const move of slots || []) {
+                    const savedPp = Number(state.moves[move.id]);
+                    if (!Number.isFinite(savedPp)) continue;
+                    move.pp = Math.max(0, Math.min(savedPp, Number(move.maxpp) || savedPp));
+                }
+            }
+        }
     });
 }
 
@@ -127,29 +137,38 @@ function publicVolatiles(pokemon) {
     }));
 }
 
+function publicConditions(conditions) {
+    return Object.fromEntries(Object.keys(conditions || {}).map(id => [id, {}]));
+}
+
 function snapshotPokemon(pokemon, side, { revealPrivate = false, requestMoves = null } = {}) {
     const slotIndex = side.pokemon.indexOf(pokemon);
+    const apparent = pokemon.illusion || pokemon;
+    const apparentSpecies = apparent.species?.name || pokemon.species.name;
+    const apparentName = apparent.name || apparentSpecies;
+    const apparentDetails = apparent.details || pokemon.details;
+    const identPrefix = String(pokemon.ident || '').split(':', 1)[0] || side.id;
     const snapshot = {
         slot: pokemon.clientSlot ?? (slotIndex >= 0 ? slotIndex + 1 : null),
-        name: pokemon.name,
-        species: pokemon.species.name,
-        ident: pokemon.ident,
-        details: pokemon.details,
-        level: pokemon.level,
-        gender: pokemon.gender,
+        name: revealPrivate ? pokemon.name : apparentName,
+        species: revealPrivate ? pokemon.species.name : apparentSpecies,
+        renderSpecies: apparentSpecies,
+        ident: revealPrivate ? pokemon.ident : `${identPrefix}: ${apparentName}`,
+        details: revealPrivate ? pokemon.details : apparentDetails,
+        level: revealPrivate ? pokemon.level : apparent.level,
+        gender: revealPrivate ? pokemon.gender : apparent.gender,
         hp: pokemon.hp,
         maxhp: pokemon.maxhp,
         status: pokemon.status || '',
         fainted: Boolean(pokemon.fainted),
         active: side.active.includes(pokemon),
-        types: [...(pokemon.types || [])],
+        types: [...((revealPrivate ? pokemon.types : apparent.types) || [])],
         boosts: { ...(pokemon.boosts || {}) },
         volatiles: publicVolatiles(pokemon),
     };
 
     if (!revealPrivate) return snapshot;
 
-    const requestById = new Map((requestMoves || []).map(move => [move.id, move]));
     snapshot.item = pokemon.item || '';
     snapshot.ability = pokemon.ability || '';
     snapshot.baseAbility = pokemon.baseAbility || '';
@@ -159,15 +178,20 @@ function snapshotPokemon(pokemon, side, { revealPrivate = false, requestMoves = 
     snapshot.evs = { ...(pokemon.set?.evs || {}) };
     snapshot.ivs = { ...(pokemon.set?.ivs || {}) };
     snapshot.nature = pokemon.set?.nature || '';
-    snapshot.moveSlots = (pokemon.moveSlots || []).map((move, index) => {
-        const requested = requestById.get(move.id) || requestMoves?.[index];
+    const sourceMoves = pokemon.moveSlots || [];
+    const visibleMoves = Array.isArray(requestMoves) ? requestMoves : sourceMoves;
+    snapshot.moveSlots = visibleMoves.map((move, index) => {
+        const source = sourceMoves.find(candidate => candidate.id === move.id)
+            || (Array.isArray(requestMoves) ? {} : sourceMoves[index])
+            || {};
         return {
-            move: requested?.move || move.move,
-            id: requested?.id || move.id,
-            pp: requested?.pp ?? move.pp,
-            maxpp: requested?.maxpp ?? move.maxpp,
-            target: requested?.target || move.target,
-            disabled: Boolean(requested?.disabled ?? move.disabled),
+            move: move.move || source.move,
+            id: move.id || source.id,
+            pp: move.pp ?? source.pp,
+            maxpp: move.maxpp ?? source.maxpp,
+            target: move.target || source.target,
+            disabled: Boolean(move.disabled ?? source.disabled),
+            index: index + 1,
         };
     });
     return snapshot;
@@ -185,6 +209,8 @@ function snapshotSide(side, request, revealPrivate) {
     return {
         name: side.name,
         activeSlot: activePokemon?.clientSlot || null,
+        sideConditions: publicConditions(side.sideConditions),
+        slotConditions: publicConditions(side.slotConditions?.[activePokemon?.position || 0]),
         party,
     };
 }
@@ -210,6 +236,15 @@ function currentState(record) {
             : null
     );
 
+    const requestPokemon = request?.side?.pokemon || [];
+    const reviving = Boolean(request?.forceSwitch && requestPokemon.some(pokemon => pokemon.active && pokemon.reviving));
+    const forcedMove = Boolean(
+        !request?.forceSwitch &&
+        request?.active?.[0]?.moves?.length === 1 &&
+        battle.p1.active[0]?.getLockedMove?.()
+    );
+    const trapped = Boolean(request?.active?.[0]?.trapped);
+
     return {
         schemaVersion: 2,
         revision: record.revision,
@@ -219,7 +254,12 @@ function currentState(record) {
         request: {
             forceSwitch: Boolean(request?.forceSwitch),
             wait: Boolean(request?.wait),
-            trapped: Boolean(request?.active?.[0]?.trapped),
+            trapped,
+            reviving,
+            forcedMove,
+            canSwitch: Boolean(request && !request.wait && (request.forceSwitch || !trapped) && !forcedMove),
+            canUseBag: Boolean(request?.active && !request.forceSwitch && !request.wait && !forcedMove),
+            canRun: Boolean(request?.active && !request.forceSwitch && !request.wait && !forcedMove),
         },
         command: {
             phase: ended
@@ -233,6 +273,11 @@ function currentState(record) {
         },
         p1,
         p2,
+        field: {
+            weather: battle.field.weather || '',
+            terrain: battle.field.terrain || '',
+            pseudoWeather: publicConditions(battle.field.pseudoWeather),
+        },
         // Compatibility aliases for clients deployed before schema v2.
         p1Active,
         p2Active,
@@ -261,6 +306,10 @@ function conditionIsFainted(condition = '') {
     return condition.includes('fnt') || condition.startsWith('0 ');
 }
 
+function isRevivalRequest(request) {
+    return Boolean(request?.forceSwitch && request.side?.pokemon?.some(pokemon => pokemon.active && pokemon.reviving));
+}
+
 function assertLegalChoice(action, request) {
     if (typeof action !== 'string' || !request) {
         throw new BattleInputError('A legal battle action is required.');
@@ -280,7 +329,15 @@ function assertLegalChoice(action, request) {
     }
     if (kind === 'switch') {
         const target = pokemon[index - 1];
-        if (!Number.isInteger(index) || !target || target.active || conditionIsFainted(target.condition)) {
+        const fainted = conditionIsFainted(target?.condition);
+        const reviving = isRevivalRequest(request);
+        if (
+            !Number.isInteger(index) ||
+            !target ||
+            target.active ||
+            (reviving ? !fainted : fainted) ||
+            (!request.forceSwitch && request.active?.[0]?.trapped)
+        ) {
             throw new BattleInputError('Invalid switch target.');
         }
         return;
@@ -297,9 +354,14 @@ function assertLegalChoice(action, request) {
 
 function randomChoice(request, random = Math.random) {
     if (request?.forceSwitch) {
+        const reviving = isRevivalRequest(request);
         const candidates = request.side.pokemon
             .map((pokemon, index) => ({ pokemon, index: index + 1 }))
-            .filter(({ pokemon }) => !pokemon.active && !conditionIsFainted(pokemon.condition));
+            .filter(({ pokemon }) => (
+                !pokemon.active && (reviving
+                    ? conditionIsFainted(pokemon.condition)
+                    : !conditionIsFainted(pokemon.condition))
+            ));
         if (!candidates.length) return null;
         return `switch ${candidates[Math.floor(random() * candidates.length)].index}`;
     }
@@ -745,6 +807,9 @@ export class BattleManager {
                 if (!p1Request?.active || p1Request.forceSwitch || p1Request.wait) {
                     throw new BattleInputError('That action is unavailable in the current phase.');
                 }
+                if (specialAction === 'run' && p1Request.active[0]?.trapped) {
+                    throw new BattleInputError('The active Pokemon is trapped and cannot run.');
+                }
                 if (specialAction === 'run' && this._runEscapes(record)) {
                     return this._escapedResponse(record, actionId);
                 }
@@ -798,6 +863,7 @@ export class BattleManager {
         }
 
         await this._resolveP2ForcedSwitch(record);
+        await this._resolveP1ForcedMoves(record);
         const activePlayer = record.battle.p1.active[0];
         if (activePlayer?.clientSlot) record.participatedSlots.add(activePlayer.clientSlot);
         const battleLog = this._drainLogs(record);
@@ -830,6 +896,38 @@ export class BattleManager {
                 : randomChoice(record.battle.p2.activeRequest, this.random);
             if (!choice || !record.battle.choose('p2', choice)) {
                 throw new BattleInputError('The opponent forced switch was rejected.');
+            }
+        }
+    }
+
+    async _resolveP1ForcedMoves(record) {
+        let safety = 0;
+        while (!record.battle.ended && !record.endedReason) {
+            await this._resolveP2ForcedSwitch(record);
+            const p1 = record.battle.p1;
+            const request = p1.activeRequest;
+            const lockedMove = p1.active[0]?.getLockedMove?.();
+            if (
+                !request?.active ||
+                request.forceSwitch ||
+                request.wait ||
+                request.active[0]?.moves?.length !== 1 ||
+                !lockedMove
+            ) break;
+            if (++safety > 8) throw new Error('Too many consecutive forced moves.');
+
+            const p2Request = record.battle.p2.activeRequest;
+            const p2Choice = p2Request && !p2Request.wait
+                ? (record.encounterType === 'trainer'
+                    ? await this._trainerChoice(record)
+                    : randomChoice(p2Request, this.random))
+                : null;
+            if (!record.battle.choose('p1', 'move 1')) {
+                throw new BattleInputError('The forced player move was rejected by the simulator.');
+            }
+            if (p2Choice && !record.battle.choose('p2', p2Choice)) {
+                record.battle.p1.clearChoice();
+                throw new BattleInputError('The opponent action during a forced move was rejected.');
             }
         }
     }
