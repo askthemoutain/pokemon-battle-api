@@ -441,7 +441,7 @@ export class BattleManager {
             revision: 0,
             endedReason: null,
             escapeAttempts: 0,
-            participatedSlots: new Set([1]),
+            participatedSlots: new Set(),
             actionResponses: new Map(),
             actionPromises: new Map(),
             actionFingerprints: new Map(),
@@ -522,14 +522,24 @@ export class BattleManager {
         if (record.encounterType === 'trainer') {
             p2Choice = await this._trainerChoice(record);
         }
+        const playerLeadIndex = record.battle.p1.pokemon.findIndex(pokemon => (
+            Number(pokemon.hp) > 0 && !pokemon.fainted
+        ));
+        if (playerLeadIndex < 0) {
+            throw new BattleInputError('The player has no Pokemon able to battle.');
+        }
+        const p1Choice = `team ${playerLeadIndex + 1}`;
+        assertLegalChoice(p1Choice, record.battle.p1.activeRequest);
         assertLegalChoice(p2Choice, record.battle.p2.activeRequest);
-        if (!record.battle.choose('p1', 'team 1')) {
+        if (!record.battle.choose('p1', p1Choice)) {
             throw new BattleInputError('The player lead could not be selected.');
         }
         if (!record.battle.choose('p2', p2Choice)) {
             record.battle.p1.clearChoice();
             throw new BattleInputError('The opponent lead could not be selected.');
         }
+        const activePlayer = record.battle.p1.active[0];
+        if (activePlayer?.clientSlot) record.participatedSlots.add(activePlayer.clientSlot);
 
         const log = this._drainLogs(record);
         record.started = true;

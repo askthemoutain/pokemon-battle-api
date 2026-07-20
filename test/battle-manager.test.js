@@ -20,7 +20,7 @@ function ticket(testMode = false) {
     }, SECRET);
 }
 
-function battleTicket(opponents, encounterType = 'wild') {
+function battleTicket(opponents, encounterType = 'wild', options = {}) {
     return signToken({
         v: 1,
         kind: 'battle',
@@ -29,8 +29,8 @@ function battleTicket(opponents, encounterType = 'wild') {
         localBattleId: '11111111-1111-4111-8111-111111111111',
         encounterType,
         opponents,
-        players: [pokemon('Pikachu', ['Thunderbolt', 'Quick Attack'])],
-        playerState: {},
+        players: options.players || [pokemon('Pikachu', ['Thunderbolt', 'Quick Attack'])],
+        playerState: options.playerState || {},
         exp: Math.floor(Date.now() / 1000) + 300,
         testMode: false,
     }, SECRET);
@@ -135,6 +135,40 @@ test('signed wild ticket fixes opponent identity and server-owned moves', async 
     assert.equal(receipt.sub, 'Player');
     assert.equal(receipt.opponents[0].species, 'Pikachu');
     assert.deepEqual(receipt.participants, [1]);
+});
+
+test('battle starts with the first healthy Pokemon and never credits an already fainted lead', async t => {
+    const manager = new BattleManager({
+        foulPlayClient: new FakeFoulPlay(),
+        trainerTicketSecret: SECRET,
+    });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'healthy-lead-start';
+    input.p2.team = [pokemon('Caterpie', ['Tackle'], { level: 5 })];
+    input.battleTicket = battleTicket(
+        [{ species: 'Caterpie', level: 5, shiny: false }],
+        'wild',
+        {
+            players: [
+                pokemon('Pikachu', ['Thunderbolt']),
+                pokemon('Eevee', ['Quick Attack']),
+            ],
+            playerState: {
+                Pikachu: { hp: 0, status: 'fnt' },
+                Eevee: { hp: 80, status: '' },
+            },
+        },
+    );
+
+    const started = await manager.start(input);
+    const receipt = JSON.parse(Buffer.from(started.receipt.split('.')[0], 'base64url').toString('utf8'));
+
+    assert.equal(started.state.p1.activeSlot, 2);
+    assert.equal(started.state.p1.party[0].fainted, true);
+    assert.equal(started.state.p1.party[1].active, true);
+    assert.equal(started.state.request.forceSwitch, false);
+    assert.deepEqual(receipt.participants, [2]);
 });
 
 test('signed wild ticket rejects a different opponent', async t => {
