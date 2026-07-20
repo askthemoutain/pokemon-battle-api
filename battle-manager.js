@@ -82,20 +82,36 @@ function canonicalWildTeam(opponents) {
     });
 }
 
+function persistedP1State(p1State, mon, index) {
+    const slot = Number(mon.clientSlot) || index + 1;
+    const slotStates = p1State.__slots;
+    if (slotStates && typeof slotStates === 'object') {
+        const slotState = Array.isArray(slotStates) ? slotStates[index] : slotStates[String(slot)];
+        if (slotState && typeof slotState === 'object') return slotState;
+    }
+
+    const wantedKeys = new Set([mon.name, mon.species.name].map(speciesId).filter(Boolean));
+    for (const [key, state] of Object.entries(p1State)) {
+        if (key.startsWith('__') || !wantedKeys.has(speciesId(key))) continue;
+        if (state && typeof state === 'object') return state;
+    }
+    return null;
+}
+
 function applyP1State(battle, p1State) {
     if (!p1State || typeof p1State !== 'object') return;
-    battle.p1.pokemon.forEach(mon => {
-        const key = mon.name || mon.species.name;
-        const searchKeys = [key, mon.species.name, key.toLowerCase(), mon.species.name.toLowerCase()];
-        const matchedKey = searchKeys.find(candidate => p1State[candidate]);
-        if (!matchedKey) return;
+    battle.p1.pokemon.forEach((mon, index) => {
+        const state = persistedP1State(p1State, mon, index);
+        if (!state) return;
 
-        const state = p1State[matchedKey];
-        if (state.hp !== undefined) {
-            mon.hp = Math.max(0, Math.min(Number(state.hp), mon.maxhp));
+        const persistedFainted = speciesId(state.status) === 'fnt';
+        const persistedHp = persistedFainted ? 0 : state.hp;
+        if (persistedHp !== undefined) {
+            const savedHp = Number(persistedHp);
+            if (Number.isFinite(savedHp)) mon.hp = Math.max(0, Math.min(savedHp, mon.maxhp));
             if (mon.hp === 0) mon.faint();
         }
-        if (state.status && state.status !== 'fnt') mon.setStatus(state.status);
+        if (state.status && !persistedFainted) mon.setStatus(state.status);
     });
 }
 

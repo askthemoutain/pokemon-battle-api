@@ -171,6 +171,49 @@ test('battle starts with the first healthy Pokemon and never credits an already 
     assert.deepEqual(receipt.participants, [2]);
 });
 
+test('battle lead selection skips every consecutive fainted Pokemon', async t => {
+    const manager = new BattleManager({
+        foulPlayClient: new FakeFoulPlay(),
+        trainerTicketSecret: SECRET,
+    });
+    t.after(() => manager.close());
+    const input = payload('wild');
+    input.requestId = 'multiple-fainted-leads-start';
+    input.p2.team = [pokemon('Caterpie', ['Tackle'], { level: 5 })];
+    input.battleTicket = battleTicket(
+        [{ species: 'Caterpie', level: 5, shiny: false }],
+        'wild',
+        {
+            players: [
+                pokemon('Deino', ['Tackle']),
+                pokemon('Doublade', ['Tackle']),
+                pokemon('Breloom', ['Mach Punch']),
+            ],
+            playerState: {
+                Deino: { hp: 0, status: 'fnt' },
+                // Legacy name keys can be stale after renames/evolutions. Slot state is authoritative.
+                Doublade: { hp: 80, status: '' },
+                Breloom: { hp: 80, status: '' },
+                __slots: {
+                    1: { hp: 0, status: 'fnt' },
+                    2: { hp: 80, status: 'fnt' },
+                    3: { hp: 80, status: '' },
+                },
+            },
+        },
+    );
+
+    const started = await manager.start(input);
+    const receipt = JSON.parse(Buffer.from(started.receipt.split('.')[0], 'base64url').toString('utf8'));
+
+    assert.equal(started.state.p1.activeSlot, 3);
+    assert.equal(started.state.p1.party[0].fainted, true);
+    assert.equal(started.state.p1.party[1].fainted, true);
+    assert.equal(started.state.p1.party[2].active, true);
+    assert.equal(started.state.request.forceSwitch, false);
+    assert.deepEqual(receipt.participants, [3]);
+});
+
 test('signed wild ticket rejects a different opponent', async t => {
     const manager = new BattleManager({
         foulPlayClient: new FakeFoulPlay(),
