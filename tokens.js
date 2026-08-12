@@ -77,7 +77,7 @@ export function verifyBattleTicket(token, secret, nowSeconds = Math.floor(Date.n
 export function verifyPvpBattleTicket(token, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
     const payload = verifySignedToken(token, secret);
     if (
-        payload.v !== 1 ||
+        ![1, 2].includes(payload.v) ||
         payload.kind !== 'pvp-battle' ||
         payload.aud !== 'pokemon-battle-api' ||
         !payload.localBattleId ||
@@ -85,6 +85,7 @@ export function verifyPvpBattleTicket(token, secret, nowSeconds = Math.floor(Dat
         !payload.participants?.p2 ||
         !Array.isArray(payload.teams?.p1) || !payload.teams.p1.length ||
         !Array.isArray(payload.teams?.p2) || !payload.teams.p2.length ||
+        (payload.v === 2 && payload.serverStart !== true) ||
         !assertFresh(payload, nowSeconds)
     ) {
         throw new Error('PvP battle ticket is expired or invalid.');
@@ -95,12 +96,13 @@ export function verifyPvpBattleTicket(token, secret, nowSeconds = Math.floor(Dat
 export function verifyPvpSideTicket(token, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
     const payload = verifySignedToken(token, secret);
     if (
-        payload.v !== 1 ||
+        ![1, 2].includes(payload.v) ||
         payload.kind !== 'pvp-side' ||
         payload.aud !== 'pokemon-battle-api' ||
         !payload.localBattleId ||
         !['p1', 'p2'].includes(payload.side) ||
         !payload.sub ||
+        (payload.v === 2 && (!payload.sessionBinding || typeof payload.battleId !== 'string')) ||
         !assertFresh(payload, nowSeconds)
     ) {
         throw new Error('PvP side ticket is expired or invalid.');
@@ -144,14 +146,29 @@ export function createPvpReceipt(record, secret, nowSeconds = Math.floor(Date.no
     }, secret);
 }
 
-export function createPvpRecoveryToken(sideTicket, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+export function createPvpBindProof(record, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
+    return signToken({
+        v: 1,
+        kind: 'pvp-bind',
+        aud: 'pokemon-covenant-php',
+        localBattleId: record.localBattleId,
+        battleId: record.battleId,
+        participants: record.participants,
+        iat: nowSeconds,
+        exp: nowSeconds + 5 * 60,
+    }, secret);
+}
+
+export function createPvpRecoveryToken(sideTicket, battleId, secret, nowSeconds = Math.floor(Date.now() / 1000)) {
     return signToken({
         v: 1,
         kind: 'pvp-recovery',
         aud: 'pokemon-covenant-php',
         localBattleId: sideTicket.localBattleId,
+        battleId,
         sub: sideTicket.sub,
         side: sideTicket.side,
+        sessionBinding: sideTicket.sessionBinding || '',
         reason: 'node-state-lost',
         iat: nowSeconds,
         exp: nowSeconds + 5 * 60,

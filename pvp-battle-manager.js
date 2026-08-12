@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { Battle, Dex, TeamValidator, extractChannelMessages } from '@pkmn/sim';
 
 import {
+    createPvpBindProof,
     createPvpReceipt,
     createPvpRejectionToken,
     createPvpRecoveryToken,
@@ -17,7 +18,39 @@ const idleMatchTimeout = 30 * 60 * 1000;
 const spectatorDelay = 10 * 1000;
 const spectatorHistoryLimit = 40;
 const pvpFormat = 'gen9nationaldexag';
+const validatorTimeout = 5000;
+const mutationRateWindow = 60 * 1000;
+const mutationRateLimit = 30;
+const startRateLimit = 8;
+const settlementResponseMaxBytes = 16384;
+const settlementRetryCapMs = 60 * 1000;
 const clone = value => JSON.parse(JSON.stringify(value));
+
+async function boundedResponseText(response, maximumBytes) {
+    const declared = Number(response.headers?.get?.('content-length') || 0);
+    if (declared > maximumBytes) throw new Error('Response body is too large.');
+    if (!response.body?.getReader) {
+        const fallback = await response.text();
+        if (Buffer.byteLength(fallback) > maximumBytes) throw new Error('Response body is too large.');
+        return fallback;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maximumBytes) throw new Error('Response body is too large.');
+            chunks.push(Buffer.from(value));
+        }
+    } catch (error) {
+        await reader.cancel().catch(() => {});
+        throw error;
+    }
+    return Buffer.concat(chunks, total).toString('utf8');
+}
 
 function canonicalJson(value) {
     if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -273,18 +306,35 @@ export class PvpBattleManager {
     constructor({
         ticketSecret = process.env.TRAINER_TICKET_SECRET || '',
         now = () => Date.now(),
+        sessionValidator = null,
+        sessionValidatorUrl = process.env.PVP_SESSION_VALIDATOR_URL
+            || 'https://pokemoncovenant.altervista.org/pages/api_pvp_session_validate.php',
+        settlementPoster = null,
+        settlementCallbackUrl = process.env.PVP_SETTLEMENT_CALLBACK_URL
+            || 'https://pokemoncovenant.altervista.org/pages/api_pvp_settle.php',
+        allowLegacyV1 = process.env.ALLOW_LEGACY_PVP_V1 === '1',
     } = {}) {
         this.ticketSecret = ticketSecret;
         this.now = now;
+        this.sessionValidator = sessionValidator;
+        this.sessionValidatorUrl = sessionValidatorUrl;
+        this.settlementPoster = settlementPoster;
+        this.settlementCallbackUrl = settlementCallbackUrl;
+        this.allowLegacyV1 = Boolean(allowLegacyV1);
         this.records = new Map();
         this.startRequests = new Map();
         this.localStarts = new Map();
+        this.rateBuckets = new Map();
+        this.settlementOutbox = new Map();
+        this.settledBattles = new Set();
         this.cleanupTimer = setInterval(() => this.cleanup(), 15 * 60 * 1000);
         this.cleanupTimer.unref?.();
     }
 
     close() {
         clearInterval(this.cleanupTimer);
+        for (const entry of this.settlementOutbox.values()) clearTimeout(entry.timer);
+        this.settlementOutbox.clear();
     }
 
     cleanup() {
@@ -297,6 +347,9 @@ export class PvpBattleManager {
         }
         for (const [requestId, entry] of this.startRequests) {
             if (entry.createdAt < cutoff) this.startRequests.delete(requestId);
+        }
+        for (const [key, entry] of this.rateBuckets) {
+            if (entry.windowStartedAt < this.now() - mutationRateWindow) this.rateBuckets.delete(key);
         }
     }
 
@@ -314,7 +367,178 @@ export class PvpBattleManager {
         if (ticket.localBattleId !== record.localBattleId || record.participants[ticket.side] !== ticket.sub) {
             throw new PvpInputError('PvP side ticket does not match this battle.', 401);
         }
+        if (ticket.v === 1) {
+            if (!this.allowLegacyV1) {
+                throw new PvpInputError('Legacy PvP authorization is disabled.', 401);
+            }
+            return ticket;
+        }
+        if (ticket.v === 2 && ticket.battleId !== record.battleId) {
+            throw new PvpInputError('PvP side ticket is not bound to this simulator battle.', 401);
+        }
+        if (ticket.v !== 2 || !ticket.sessionBinding) {
+            throw new PvpInputError('PvP side ticket is not session-bound.', 401);
+        }
         return ticket;
+    }
+
+    _consumeRate(key, limit) {
+        const now = this.now();
+        let entry = this.rateBuckets.get(key);
+        if (!entry || now - entry.windowStartedAt >= mutationRateWindow) {
+            entry = { windowStartedAt: now, count: 0 };
+            this.rateBuckets.set(key, entry);
+        }
+        if (entry.count >= limit) {
+            throw new PvpInputError('Too many PvP requests. Retry shortly.', 429, {
+                retryAfterMs: Math.max(1, mutationRateWindow - (now - entry.windowStartedAt)),
+            });
+        }
+        entry.count++;
+    }
+
+    async _assertCurrentSession({ localBattleId, battleId = '', ticket, action }) {
+        if (!ticket?.sessionBinding) throw new PvpInputError('PvP session binding is missing.', 401);
+        const request = {
+            localBattleId,
+            battleId,
+            sub: ticket.sub,
+            side: ticket.side,
+            sessionBinding: ticket.sessionBinding,
+            action,
+        };
+        if (this.sessionValidator) {
+            let valid;
+            try {
+                valid = await this.sessionValidator(clone(request));
+            } catch {
+                throw new PvpInputError('PvP session validator is unavailable.', 503);
+            }
+            if (valid !== true) throw new PvpInputError('PvP session was replaced.', 401);
+            return;
+        }
+        if (!this.sessionValidatorUrl || !this.ticketSecret) {
+            throw new PvpInputError('PvP session validator is not configured.', 503);
+        }
+        let validatorUrl;
+        try {
+            validatorUrl = new URL(this.sessionValidatorUrl);
+        } catch {
+            throw new PvpInputError('PvP session validator is not configured.', 503);
+        }
+        if (validatorUrl.protocol !== 'https:' || validatorUrl.username || validatorUrl.password || validatorUrl.hash) {
+            throw new PvpInputError('PvP session validator is not configured securely.', 503);
+        }
+        const body = JSON.stringify(request);
+        if (Buffer.byteLength(body) > 4096) throw new PvpInputError('PvP session validator request is invalid.', 503);
+        const timestamp = Math.floor(this.now() / 1000);
+        const canonical = `pvp-session-validator-v1\n${timestamp}\n${crypto.createHash('sha256').update(body).digest('hex')}`;
+        const signature = crypto.createHmac('sha256', this.ticketSecret).update(canonical).digest('hex');
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), validatorTimeout);
+        let response;
+        try {
+            response = await fetch(validatorUrl, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-covenant-timestamp': String(timestamp),
+                    'x-covenant-signature': signature,
+                },
+                body,
+                signal: controller.signal,
+                redirect: 'error',
+            });
+        } catch {
+            throw new PvpInputError('PvP session validator is unavailable.', 503);
+        } finally {
+            clearTimeout(timer);
+        }
+        if (response.status === 401 || response.status === 403) {
+            throw new PvpInputError('PvP session was replaced.', 401);
+        }
+        if (!response.ok) throw new PvpInputError('PvP session validator is unavailable.', 503);
+        let raw;
+        try {
+            raw = await boundedResponseText(response, 4096);
+        } catch {
+            throw new PvpInputError('PvP session validator is unavailable.', 503);
+        }
+        const result = (() => { try { return JSON.parse(raw); } catch { return null; } })();
+        if (!result?.success || result.current !== true) {
+            throw new PvpInputError('PvP session validator is unavailable.', 503);
+        }
+    }
+
+    _queueSettlement(record, receipt) {
+        const key = `${record.localBattleId}:${record.battleId}`;
+        if (this.settledBattles.has(key) || this.settlementOutbox.has(key)) return;
+        const entry = { key, receipt, attempts: 0, timer: null, delivering: false };
+        this.settlementOutbox.set(key, entry);
+        queueMicrotask(() => this._deliverSettlement(entry));
+    }
+
+    async _postSettlement(receipt) {
+        if (this.settlementPoster) return (await this.settlementPoster(receipt)) === true;
+        let callbackUrl;
+        try {
+            callbackUrl = new URL(this.settlementCallbackUrl);
+        } catch {
+            return false;
+        }
+        if (callbackUrl.protocol !== 'https:' || callbackUrl.username || callbackUrl.password || callbackUrl.hash) return false;
+        const body = JSON.stringify({ receipt });
+        if (Buffer.byteLength(body) > 262144) return false;
+        const timestamp = Math.floor(this.now() / 1000);
+        const canonical = `pvp-settlement-callback-v1\n${timestamp}\n${crypto.createHash('sha256').update(body).digest('hex')}`;
+        const signature = crypto.createHmac('sha256', this.ticketSecret).update(canonical).digest('hex');
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), validatorTimeout);
+        let response;
+        try {
+            response = await fetch(callbackUrl, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-covenant-timestamp': String(timestamp),
+                    'x-covenant-signature': signature,
+                },
+                body,
+                signal: controller.signal,
+                redirect: 'error',
+            });
+            if (!response.ok) return false;
+            const raw = await boundedResponseText(response, settlementResponseMaxBytes);
+            const payload = JSON.parse(raw);
+            return payload?.success === true;
+        } catch {
+            return false;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async _deliverSettlement(entry) {
+        if (entry.delivering || !this.settlementOutbox.has(entry.key)) return;
+        entry.delivering = true;
+        entry.attempts++;
+        let delivered = false;
+        try {
+            delivered = await this._postSettlement(entry.receipt);
+        } catch {
+            delivered = false;
+        } finally {
+            entry.delivering = false;
+        }
+        if (!this.settlementOutbox.has(entry.key)) return;
+        if (delivered) {
+            this.settlementOutbox.delete(entry.key);
+            this.settledBattles.add(entry.key);
+            return;
+        }
+        const delay = Math.min(settlementRetryCapMs, 1000 * (2 ** Math.min(entry.attempts - 1, 6)));
+        entry.timer = setTimeout(() => this._deliverSettlement(entry), delay);
+        entry.timer.unref?.();
     }
 
     _verifySpectator(record, token) {
@@ -411,6 +635,7 @@ export class PvpBattleManager {
         };
         if (record.battle.ended || record.endedReason) {
             response.receipt = createPvpReceipt(record, this.ticketSecret, Math.floor(this.now() / 1000));
+            this._queueSettlement(record, response.receipt);
         }
         return response;
     }
@@ -443,7 +668,9 @@ export class PvpBattleManager {
         if (existing && existing.fingerprint !== fingerprint) {
             throw new PvpInputError('requestId was reused with a different PvP battle.', 409);
         }
-        if (existing) return this._response(existing.record, 'p1');
+        if (existing) return this._response(existing.record, 'p1', {
+            bindProof: createPvpBindProof(existing.record, this.ticketSecret, Math.floor(this.now() / 1000)),
+        });
 
         const localExisting = this.localStarts.get(ticket.localBattleId);
         if (localExisting && localExisting.fingerprint !== fingerprint) {
@@ -451,7 +678,24 @@ export class PvpBattleManager {
         }
         if (localExisting) {
             this.startRequests.set(requestId, localExisting);
-            return this._response(localExisting.record, 'p1');
+            return this._response(localExisting.record, 'p1', {
+                bindProof: createPvpBindProof(localExisting.record, this.ticketSecret, Math.floor(this.now() / 1000)),
+            });
+        }
+
+        this._consumeRate(`start:${sideTicket.sub}`, startRateLimit);
+        if (ticket.v === 1 && sideTicket.v === 1 && !this.allowLegacyV1) {
+            throw new PvpInputError('Legacy PvP authorization is disabled.', 401);
+        }
+        if (ticket.v === 2 || sideTicket.v === 2) {
+            if (ticket.v !== 2 || sideTicket.v !== 2) {
+                throw new PvpInputError('PvP ticket versions do not match.', 401);
+            }
+            await this._assertCurrentSession({
+                localBattleId: ticket.localBattleId,
+                ticket: sideTicket,
+                action: 'start',
+            });
         }
 
         let p1Team;
@@ -498,7 +742,9 @@ export class PvpBattleManager {
         const startEntry = { record, fingerprint, createdAt: now };
         this.startRequests.set(requestId, startEntry);
         this.localStarts.set(record.localBattleId, startEntry);
-        return this._response(record, 'p1');
+        return this._response(record, 'p1', {
+            bindProof: createPvpBindProof(record, this.ticketSecret, Math.floor(this.now() / 1000)),
+        });
     }
 
     async state(payload) {
@@ -524,7 +770,6 @@ export class PvpBattleManager {
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
         const sideTicket = this._verifySide(record, payload.sideTicket);
         const side = sideTicket.side;
-        this._endByClock(record);
         const actionId = String(payload.actionId || '');
         if (!actionId || actionId.length > 100) throw new PvpInputError('A valid actionId is required.');
         const key = `${side}:${actionId}`;
@@ -541,7 +786,17 @@ export class PvpBattleManager {
                     || record.revision > Number(cached?.state?.revision || 0),
             });
         }
+        this._endByClock(record);
         if (record.battle.ended || record.endedReason) throw new PvpInputError('PvP battle already ended.', 409);
+        this._consumeRate(`mutate:${record.localBattleId}:${sideTicket.sub}`, mutationRateLimit);
+        if (sideTicket.v === 2) {
+            await this._assertCurrentSession({
+                localBattleId: record.localBattleId,
+                battleId: record.battleId,
+                ticket: sideTicket,
+                action: 'action',
+            });
+        }
         if (Number(payload.expectedRevision) !== record.revision) {
             throw new PvpInputError('PvP state is stale.', 409, { state: currentState(record, side) });
         }
@@ -587,6 +842,17 @@ export class PvpBattleManager {
         const record = this.records.get(payload?.battleId);
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
         const sideTicket = this._verifySide(record, payload.sideTicket);
+        if (!record.battle.ended && !record.endedReason) {
+            this._consumeRate(`mutate:${record.localBattleId}:${sideTicket.sub}`, mutationRateLimit);
+            if (sideTicket.v === 2) {
+                await this._assertCurrentSession({
+                    localBattleId: record.localBattleId,
+                    battleId: record.battleId,
+                    ticket: sideTicket,
+                    action: 'forfeit',
+                });
+            }
+        }
         this._endByClock(record);
         if (!record.battle.ended && !record.endedReason) {
             const winnerSide = sideTicket.side === 'p1' ? 'p2' : 'p1';
@@ -603,6 +869,17 @@ export class PvpBattleManager {
         const record = this.records.get(payload?.battleId);
         if (!record) throw new PvpInputError('PvP battle not found or expired.', 404);
         const sideTicket = this._verifySide(record, payload.sideTicket);
+        if (!record.battle.ended && !record.endedReason) {
+            this._consumeRate(`mutate:${record.localBattleId}:${sideTicket.sub}`, mutationRateLimit);
+            if (sideTicket.v === 2) {
+                await this._assertCurrentSession({
+                    localBattleId: record.localBattleId,
+                    battleId: record.battleId,
+                    ticket: sideTicket,
+                    action: 'timeout',
+                });
+            }
+        }
         this._endByClock(record);
         if (record.battle.ended || record.endedReason) return this._response(record, sideTicket.side);
         const ownChoice = record.pendingChoices[sideTicket.side];
@@ -631,8 +908,18 @@ export class PvpBattleManager {
         } catch (error) {
             throw new PvpInputError(error.message, 401);
         }
-        const record = [...this.records.values()].find(candidate => candidate.localBattleId === sideTicket.localBattleId);
+        const requestedBattleId = String(payload?.battleId || '');
+        if (!/^[a-f0-9-]{36}$/i.test(requestedBattleId)) {
+            throw new PvpInputError('A bound PvP battleId is required for recovery.', 400);
+        }
+        if (sideTicket.v !== 2 || sideTicket.battleId !== requestedBattleId) {
+            throw new PvpInputError('PvP recovery ticket is not bound to this simulator battle.', 401);
+        }
+        const record = this.records.get(requestedBattleId);
         if (record) {
+            if (record.localBattleId !== sideTicket.localBattleId) {
+                throw new PvpInputError('PvP recovery ticket does not match this battle.', 401);
+            }
             this._verifySide(record, payload.sideTicket);
             this._endByClock(record);
             return this._response(record, sideTicket.side, { recovered: true });
@@ -641,7 +928,8 @@ export class PvpBattleManager {
             success: true,
             missing: true,
             localBattleId: sideTicket.localBattleId,
-            recoveryToken: createPvpRecoveryToken(sideTicket, this.ticketSecret, Math.floor(this.now() / 1000)),
+            battleId: requestedBattleId,
+            recoveryToken: createPvpRecoveryToken(sideTicket, requestedBattleId, this.ticketSecret, Math.floor(this.now() / 1000)),
         };
     }
 }

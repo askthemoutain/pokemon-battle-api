@@ -588,7 +588,9 @@ test('two-turn and recharge phases continue automatically from one player choice
 
     const rechargeInput = payload('wild');
     rechargeInput.requestId = 'forced-recharge-start';
-    rechargeInput.p1.team = [pokemon('Caterpie', ['Hyper Beam', 'Tackle'], { level: 1 })];
+    // Prismatic Laser has the same mandatory recharge contract but 100% accuracy,
+    // so this test measures continuation handling instead of occasionally testing a miss.
+    rechargeInput.p1.team = [pokemon('Caterpie', ['Prismatic Laser', 'Tackle'], { level: 1 })];
     rechargeInput.p2.team = [pokemon('Blissey', ['Splash'], { level: 100 })];
     const rechargeStart = await manager.start(rechargeInput);
     const recharged = await manager.action({
