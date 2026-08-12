@@ -103,6 +103,11 @@ export function verifyPvpSideTicket(token, secret, nowSeconds = Math.floor(Date.
         !['p1', 'p2'].includes(payload.side) ||
         !payload.sub ||
         (payload.v === 2 && (!payload.sessionBinding || typeof payload.battleId !== 'string')) ||
+        (payload.v === 2 && payload.world !== null && payload.world !== undefined && (
+            !payload.world.routeId || !payload.world.instanceKey || !payload.world.mapRevision ||
+            !Number.isInteger(payload.world.roomId) || !Number.isInteger(payload.world.leaseEpoch) ||
+            !/^[a-f0-9]{64}$/i.test(payload.world.tabHash || '')
+        )) ||
         !assertFresh(payload, nowSeconds)
     ) {
         throw new Error('PvP side ticket is expired or invalid.');
@@ -169,6 +174,7 @@ export function createPvpRecoveryToken(sideTicket, battleId, secret, nowSeconds 
         sub: sideTicket.sub,
         side: sideTicket.side,
         sessionBinding: sideTicket.sessionBinding || '',
+        world: sideTicket.world || null,
         reason: 'node-state-lost',
         iat: nowSeconds,
         exp: nowSeconds + 5 * 60,

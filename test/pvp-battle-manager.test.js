@@ -175,6 +175,204 @@ test('terminal settlement retries after a transient callback failure', async t =
     assert.equal(manager.settledBattles.has(`${data.localBattleId}:${started.battleId}`), true);
 });
 
+test('settlement retry refreshes an expired receipt without changing its terminal outcome', async t => {
+    let now = Date.now();
+    const receipts = [];
+    const verifyReceiptAtCurrentTime = token => {
+        const payload = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8'));
+        assert.equal(signToken(payload, SECRET), token);
+        assert.ok(payload.iat <= Math.floor(now / 1000));
+        assert.ok(payload.exp >= Math.floor(now / 1000));
+        receipts.push(payload);
+        return payload;
+    };
+    const manager = makeManager({
+        now: () => now,
+        settlementPoster: async receipt => {
+            verifyReceiptAtCurrentTime(receipt);
+            return receipts.length > 1;
+        },
+    });
+    t.after(() => manager.close());
+    const data = bundle('91');
+    const started = await start(manager, data, 'fresh-settlement-retry');
+    const firstResponse = await manager.forfeit({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1', Math.floor(now / 1000)),
+    });
+    assert.equal(firstResponse.settlementPending, true);
+    const key = `${data.localBattleId}:${started.battleId}`;
+    const entry = manager.settlementOutbox.get(key);
+    assert.ok(entry);
+    assert.equal(entry.receipt, undefined);
+    assert.equal(Object.isFrozen(entry.outcome), true);
+    clearTimeout(entry.timer);
+    entry.timer = null;
+
+    now += (2 * 60 * 60 * 1000) + 1000;
+    assert.ok(receipts[0].exp < Math.floor(now / 1000), 'the first callback receipt must now be stale');
+    assert.equal(await manager._deliverSettlement(entry), true);
+    assert.equal(receipts.length, 2);
+    assert.ok(receipts[1].iat > receipts[0].iat);
+    assert.deepEqual(receipts[1].state, receipts[0].state);
+    assert.equal(receipts[1].revision, receipts[0].revision);
+    assert.deepEqual(receipts[1].participants, receipts[0].participants);
+
+    const replay = await manager.state({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p2', Math.floor(now / 1000)),
+    });
+    const replayReceipt = verifyReceiptAtCurrentTime(replay.receipt);
+    assert.deepEqual(replayReceipt.state, receipts[0].state);
+    assert.equal(replayReceipt.revision, receipts[0].revision);
+});
+
+test('terminal response marks settlement pending when the first authoritative callback fails', async t => {
+    const manager = makeManager({ settlementPoster: async () => false });
+    t.after(() => manager.close());
+    const data = bundle('87');
+    const started = await start(manager, data, 'settlement-pending');
+    const ended = await manager.forfeit({ battleId: started.battleId, sideTicket: data.sideTicket('p1') });
+    assert.equal(ended.state.ended, true);
+    assert.equal(ended.settlementPending, true);
+    assert.equal(manager.settlementOutbox.size, 1);
+});
+
+test('a terminal action awaits its first settlement callback before resolving', async t => {
+    let releaseCallback;
+    let callbackStarted = false;
+    const callbackGate = new Promise(resolve => { releaseCallback = resolve; });
+    const manager = makeManager({ settlementPoster: async () => {
+        callbackStarted = true;
+        await callbackGate;
+        return true;
+    } });
+    t.after(() => manager.close());
+    const data = bundle('89', '', {
+        p1: [mon('Pikachu', ['Thunderbolt'], 100)],
+        p2: [mon('Magikarp', ['Splash'], 1)],
+    });
+    const started = await start(manager, data, 'terminal-action-awaits');
+    await manager.action({
+        battleId: started.battleId, sideTicket: data.sideTicket('p1'),
+        actionId: 'terminal-p1', expectedRevision: 1, action: 'move 1',
+    });
+    let resolved = false;
+    const terminalPromise = manager.action({
+        battleId: started.battleId, sideTicket: data.sideTicket('p2'),
+        actionId: 'terminal-p2', expectedRevision: 1, action: 'move 1',
+    }).then(result => { resolved = true; return result; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(callbackStarted, true);
+    assert.equal(resolved, false);
+    releaseCallback();
+    const terminal = await terminalPromise;
+    assert.equal(terminal.state.ended, true);
+    assert.equal(terminal.settlementPending, undefined);
+});
+
+test('concurrent terminal responses join one authoritative settlement callback', async t => {
+    let releaseCallback;
+    let callbackCalls = 0;
+    const callbackGate = new Promise(resolve => { releaseCallback = resolve; });
+    const manager = makeManager({ settlementPoster: async () => {
+        callbackCalls++;
+        await callbackGate;
+        return true;
+    } });
+    t.after(() => manager.close());
+    const data = bundle('90');
+    const started = await start(manager, data, 'concurrent-terminal-settlement');
+    let forfeitResolved = false;
+    const forfeitPromise = manager.forfeit({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+    }).then(result => { forfeitResolved = true; return result; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(callbackCalls, 1);
+
+    let stateResolved = false;
+    const statePromise = manager.state({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p2'),
+    }).then(result => { stateResolved = true; return result; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(forfeitResolved, false);
+    assert.equal(stateResolved, false);
+    assert.equal(callbackCalls, 1);
+
+    releaseCallback();
+    const [forfeit, state] = await Promise.all([forfeitPromise, statePromise]);
+    assert.equal(forfeit.state.ended, true);
+    assert.equal(state.state.ended, true);
+    assert.equal(forfeit.settlementPending, undefined);
+    assert.equal(state.settlementPending, undefined);
+    assert.equal(callbackCalls, 1);
+});
+
+test('world lease claim is forwarded unchanged to the fail-closed session validator', async t => {
+    const requests = [];
+    const manager = makeManager({ sessionValidator: async request => { requests.push(request); return true; } });
+    t.after(() => manager.close());
+    const data = bundle('88');
+    const world = {
+        roomId: 8,
+        routeId: 'pay-field-low-route',
+        instanceKey: 'public',
+        mapRevision: '5',
+        leaseEpoch: 7,
+        tabHash: 'a'.repeat(64),
+    };
+    data.sideTicket = side => signToken({
+        v: 2, kind: 'pvp-side', aud: 'pokemon-battle-api', localBattleId: data.localBattleId,
+        sub: data.participants[side], side, battleId: data.battleId,
+        sessionBinding: 'session-88', world, exp: Math.floor(Date.now() / 1000) + 30,
+    }, SECRET);
+    const started = await start(manager, data, 'world-claim');
+    await manager.action({
+        battleId: started.battleId,
+        sideTicket: data.sideTicket('p1'),
+        actionId: 'world-action',
+        expectedRevision: 1,
+        action: 'move 1',
+    });
+    assert.deepEqual(requests.at(-1).world, world);
+});
+
+test('a new leader lease resumes while the old tab ticket is rejected immediately', async t => {
+    const newWorld = {
+        roomId: 8, routeId: 'pay-field-low-route', instanceKey: 'public', mapRevision: '5',
+        leaseEpoch: 12, tabHash: 'b'.repeat(64),
+    };
+    const manager = makeManager({
+        sessionValidator: async request => request.action === 'start'
+            || (request.world?.leaseEpoch === newWorld.leaseEpoch && request.world?.tabHash === newWorld.tabHash),
+    });
+    t.after(() => manager.close());
+    const data = bundle('90');
+    const ticketFor = (side, world) => signToken({
+        v: 2, kind: 'pvp-side', aud: 'pokemon-battle-api', localBattleId: data.localBattleId,
+        sub: data.participants[side], side, battleId: data.battleId,
+        sessionBinding: 'session-90', world, exp: Math.floor(Date.now() / 1000) + 30,
+    }, SECRET);
+    const startTicket = ticketFor('p1', { ...newWorld, leaseEpoch: 11, tabHash: 'a'.repeat(64) });
+    const started = await manager.start({
+        requestId: 'lease-rebind-start', battleTicket: data.battleTicket, sideTicket: startTicket,
+    });
+    data.battleId = started.battleId;
+    const oldTicket = ticketFor('p1', { ...newWorld, leaseEpoch: 11, tabHash: 'a'.repeat(64) });
+    const newTicket = ticketFor('p1', newWorld);
+    await assert.rejects(manager.action({
+        battleId: started.battleId, sideTicket: oldTicket,
+        actionId: 'old-tab', expectedRevision: 1, action: 'move 1',
+    }), error => error?.status === 401);
+    const resumed = await manager.action({
+        battleId: started.battleId, sideTicket: newTicket,
+        actionId: 'new-leader', expectedRevision: 1, action: 'move 1',
+    });
+    assert.equal(resumed.accepted, true);
+});
+
 test('PvP resolves only after both signed sides submit', async t => {
     const manager = makeManager();
     t.after(() => manager.close());
@@ -289,6 +487,56 @@ test('spectators receive delayed public state without either side private data',
         assert.equal(visible.item, undefined);
         assert.equal(visible.ability, undefined);
     }
+});
+
+test('opponents and spectators see normalized HP while each player keeps exact own HP', async t => {
+    let now = Date.now();
+    const manager = makeManager({ now: () => now });
+    t.after(() => manager.close());
+    const data = bundle('92', '', {
+        p1: [mon('Pikachu', ['Thunder Shock'], 50)],
+        p2: [mon('Snorlax', ['Tackle'], 50)],
+    });
+    const started = await start(manager, data, 'normalized-public-hp');
+    const record = manager.getRecord(started.battleId);
+    const p1Pokemon = record.battle.p1.pokemon[0];
+    const p2Pokemon = record.battle.p2.pokemon[0];
+    p1Pokemon.hp = Math.max(1, Math.floor(p1Pokemon.maxhp / 3));
+    p2Pokemon.hp = Math.max(1, Math.floor(p2Pokemon.maxhp * 0.61));
+    record.revision++;
+    manager._captureSpectator(record);
+
+    const p1View = await manager.state({ battleId: started.battleId, sideTicket: data.sideTicket('p1') });
+    const p2View = await manager.state({ battleId: started.battleId, sideTicket: data.sideTicket('p2') });
+    assert.equal(p1View.state.p1.party[0].hp, p1Pokemon.hp);
+    assert.equal(p1View.state.p1.party[0].maxhp, p1Pokemon.maxhp);
+    assert.equal(p2View.state.p2.party[0].hp, p2Pokemon.hp);
+    assert.equal(p2View.state.p2.party[0].maxhp, p2Pokemon.maxhp);
+    assert.equal(p1View.state.p2.party[0].maxhp, 100);
+    assert.equal(p1View.state.p2.party[0].hp, Math.ceil((p2Pokemon.hp / p2Pokemon.maxhp) * 100));
+    assert.equal(p2View.state.p1.party[0].maxhp, 100);
+    assert.equal(p2View.state.p1.party[0].hp, Math.ceil((p1Pokemon.hp / p1Pokemon.maxhp) * 100));
+
+    now += 10001;
+    const watched = await manager.spectate({
+        battleId: started.battleId,
+        spectatorTicket: spectatorTicket(data, started.battleId),
+    });
+    for (const side of ['p1', 'p2']) {
+        assert.equal(watched.state[side].party[0].maxhp, 100);
+        assert.ok(watched.state[side].party[0].hp >= 1 && watched.state[side].party[0].hp <= 100);
+    }
+    p1Pokemon.hp = 0;
+    p1Pokemon.fainted = true;
+    record.revision++;
+    manager._captureSpectator(record);
+    now += 10001;
+    const fainted = await manager.spectate({
+        battleId: started.battleId,
+        spectatorTicket: spectatorTicket(data, started.battleId),
+    });
+    assert.equal(fainted.state.p1.party[0].hp, 0);
+    assert.equal(fainted.state.p1.party[0].maxhp, 100);
 });
 
 test('spectator tickets are battle-bound and cannot act as side tickets', async t => {

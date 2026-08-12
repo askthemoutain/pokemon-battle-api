@@ -167,6 +167,15 @@ function publicConditions(conditions) {
     return Object.fromEntries(Object.keys(conditions || {}).map(id => [id, {}]));
 }
 
+function publicHpPercent(pokemon) {
+    const hp = Math.max(0, Number(pokemon.hp) || 0);
+    const maxhp = Math.max(1, Number(pokemon.maxhp) || 1);
+    if (pokemon.fainted || hp <= 0) return 0;
+    // Ceil keeps every conscious Pokemon visibly above zero while exposing
+    // only the standard 0..100 public health scale, never exact HP stats.
+    return Math.max(1, Math.min(100, Math.ceil((hp / maxhp) * 100)));
+}
+
 function snapshotPokemon(pokemon, side, revealPrivate, requestMoves = null) {
     const slotIndex = side.pokemon.indexOf(pokemon);
     const apparent = pokemon.illusion || pokemon;
@@ -183,8 +192,8 @@ function snapshotPokemon(pokemon, side, revealPrivate, requestMoves = null) {
         details: revealPrivate ? pokemon.details : apparentDetails,
         level: revealPrivate ? pokemon.level : apparent.level,
         gender: revealPrivate ? pokemon.gender : apparent.gender,
-        hp: pokemon.hp,
-        maxhp: pokemon.maxhp,
+        hp: revealPrivate ? pokemon.hp : publicHpPercent(pokemon),
+        maxhp: revealPrivate ? pokemon.maxhp : 100,
         status: pokemon.status || '',
         fainted: Boolean(pokemon.fainted),
         active: side.active.includes(pokemon),
@@ -405,6 +414,7 @@ export class PvpBattleManager {
             sub: ticket.sub,
             side: ticket.side,
             sessionBinding: ticket.sessionBinding,
+            world: ticket.world || null,
             action,
         };
         if (this.sessionValidator) {
@@ -470,12 +480,42 @@ export class PvpBattleManager {
         }
     }
 
-    _queueSettlement(record, receipt) {
+    _terminalReceiptOutcome(record) {
+        const participants = Object.freeze({
+            p1: String(record.participants.p1 || ''),
+            p2: String(record.participants.p2 || ''),
+        });
+        const battle = Object.freeze({
+            ended: Boolean(record.battle.ended),
+            winner: String(record.battle.winner || ''),
+            turn: Number(record.battle.turn) || 0,
+        });
+        return Object.freeze({
+            localBattleId: String(record.localBattleId),
+            battleId: String(record.battleId),
+            revision: Number(record.revision),
+            participants,
+            endedReason: String(record.endedReason || ''),
+            battle,
+        });
+    }
+
+    _queueSettlement(record) {
         const key = `${record.localBattleId}:${record.battleId}`;
-        if (this.settledBattles.has(key) || this.settlementOutbox.has(key)) return;
-        const entry = { key, receipt, attempts: 0, timer: null, delivering: false };
+        if (this.settledBattles.has(key)) return null;
+        const existing = this.settlementOutbox.get(key);
+        if (existing) return existing;
+        const entry = {
+            key,
+            outcome: this._terminalReceiptOutcome(record),
+            attempts: 0,
+            timer: null,
+            delivering: false,
+            deliveryPromise: null,
+        };
         this.settlementOutbox.set(key, entry);
-        queueMicrotask(() => this._deliverSettlement(entry));
+        queueMicrotask(() => { void this._deliverSettlement(entry); });
+        return entry;
     }
 
     async _postSettlement(receipt) {
@@ -519,26 +559,65 @@ export class PvpBattleManager {
     }
 
     async _deliverSettlement(entry) {
-        if (entry.delivering || !this.settlementOutbox.has(entry.key)) return;
-        entry.delivering = true;
-        entry.attempts++;
-        let delivered = false;
+        if (!this.settlementOutbox.has(entry.key)) return this.settledBattles.has(entry.key);
+        if (entry.deliveryPromise) return entry.deliveryPromise;
+        const deliveryPromise = (async () => {
+            entry.delivering = true;
+            entry.attempts++;
+            let delivered = false;
+            try {
+                // Receipts expire, but the terminal outcome does not. Sign a
+                // new envelope for every attempt so a long callback outage
+                // cannot poison the durable retry with an expired token.
+                const receipt = createPvpReceipt(entry.outcome, this.ticketSecret, Math.floor(this.now() / 1000));
+                delivered = await this._postSettlement(receipt);
+            } catch {
+                delivered = false;
+            } finally {
+                entry.delivering = false;
+            }
+            if (!this.settlementOutbox.has(entry.key)) return this.settledBattles.has(entry.key);
+            if (delivered) {
+                this.settlementOutbox.delete(entry.key);
+                this.settledBattles.add(entry.key);
+                return true;
+            }
+            const delay = Math.min(settlementRetryCapMs, 1000 * (2 ** Math.min(entry.attempts - 1, 6)));
+            entry.timer = setTimeout(() => {
+                entry.timer = null;
+                void this._deliverSettlement(entry);
+            }, delay);
+            entry.timer.unref?.();
+            return false;
+        })();
+        entry.deliveryPromise = deliveryPromise;
         try {
-            delivered = await this._postSettlement(entry.receipt);
-        } catch {
-            delivered = false;
+            return await deliveryPromise;
         } finally {
-            entry.delivering = false;
+            if (entry.deliveryPromise === deliveryPromise) entry.deliveryPromise = null;
         }
-        if (!this.settlementOutbox.has(entry.key)) return;
-        if (delivered) {
-            this.settlementOutbox.delete(entry.key);
-            this.settledBattles.add(entry.key);
-            return;
+    }
+
+    async _attemptTerminalSettlement(record) {
+        const key = `${record.localBattleId}:${record.battleId}`;
+        if (this.settledBattles.has(key)) return true;
+        let entry = this.settlementOutbox.get(key);
+        if (!entry) {
+            entry = {
+                key,
+                outcome: this._terminalReceiptOutcome(record),
+                attempts: 0,
+                timer: null,
+                delivering: false,
+                deliveryPromise: null,
+            };
+            this.settlementOutbox.set(key, entry);
         }
-        const delay = Math.min(settlementRetryCapMs, 1000 * (2 ** Math.min(entry.attempts - 1, 6)));
-        entry.timer = setTimeout(() => this._deliverSettlement(entry), delay);
-        entry.timer.unref?.();
+        if (entry.timer) {
+            clearTimeout(entry.timer);
+            entry.timer = null;
+        }
+        return this._deliverSettlement(entry);
     }
 
     _verifySpectator(record, token) {
@@ -635,8 +714,15 @@ export class PvpBattleManager {
         };
         if (record.battle.ended || record.endedReason) {
             response.receipt = createPvpReceipt(record, this.ticketSecret, Math.floor(this.now() / 1000));
-            this._queueSettlement(record, response.receipt);
+            this._queueSettlement(record);
         }
+        return response;
+    }
+
+    async _terminalResponse(record, side, extra = {}) {
+        const settled = await this._attemptTerminalSettlement(record);
+        const response = this._response(record, side, extra);
+        if (!settled) response.settlementPending = true;
         return response;
     }
 
@@ -753,6 +839,7 @@ export class PvpBattleManager {
         const sideTicket = this._verifySide(record, payload.sideTicket);
         record.lastAccess = this.now();
         this._endByClock(record);
+        if (record.battle.ended || record.endedReason) return this._terminalResponse(record, sideTicket.side);
         return this._response(record, sideTicket.side);
     }
 
@@ -779,15 +866,17 @@ export class PvpBattleManager {
         }
         if (record.actionResponses.has(key)) {
             const cached = record.actionResponses.get(key);
-            return this._response(record, side, {
+            const extra = {
                 accepted: true,
                 replayed: true,
                 resolved: Boolean(cached?.resolved)
                     || record.revision > Number(cached?.state?.revision || 0),
-            });
+            };
+            if (record.battle.ended || record.endedReason) return this._terminalResponse(record, side, extra);
+            return this._response(record, side, extra);
         }
         this._endByClock(record);
-        if (record.battle.ended || record.endedReason) throw new PvpInputError('PvP battle already ended.', 409);
+        if (record.battle.ended || record.endedReason) return this._terminalResponse(record, side, { resolved: true });
         this._consumeRate(`mutate:${record.localBattleId}:${sideTicket.sub}`, mutationRateLimit);
         if (sideTicket.v === 2) {
             await this._assertCurrentSession({
@@ -833,7 +922,9 @@ export class PvpBattleManager {
         record.lastProgressAt = this.now();
         this._drainLogs(record);
         this._captureSpectator(record);
-        const response = this._response(record, side, { accepted: true, resolved: true });
+        const response = record.battle.ended || record.endedReason
+            ? await this._terminalResponse(record, side, { accepted: true, resolved: true })
+            : this._response(record, side, { accepted: true, resolved: true });
         record.actionResponses.set(key, response);
         return response;
     }
@@ -862,7 +953,7 @@ export class PvpBattleManager {
             this._appendPublicEvent(record, `|covenant|forfeit|${sideTicket.side}`);
             this._captureSpectator(record);
         }
-        return this._response(record, sideTicket.side, { forfeited: true });
+        return this._terminalResponse(record, sideTicket.side, { forfeited: true });
     }
 
     async claimTimeout(payload) {
@@ -881,7 +972,7 @@ export class PvpBattleManager {
             }
         }
         this._endByClock(record);
-        if (record.battle.ended || record.endedReason) return this._response(record, sideTicket.side);
+        if (record.battle.ended || record.endedReason) return this._terminalResponse(record, sideTicket.side);
         const ownChoice = record.pendingChoices[sideTicket.side];
         const opponentSide = sideTicket.side === 'p1' ? 'p2' : 'p1';
         const opponentRequest = record.battle[opponentSide].activeRequest;
@@ -898,7 +989,7 @@ export class PvpBattleManager {
         record.pendingChoices = {};
         this._appendPublicEvent(record, `|covenant|timeout|${opponentSide}`);
         this._captureSpectator(record);
-        return this._response(record, sideTicket.side, { timeoutClaimed: true });
+        return this._terminalResponse(record, sideTicket.side, { timeoutClaimed: true });
     }
 
     async recover(payload) {
@@ -922,6 +1013,9 @@ export class PvpBattleManager {
             }
             this._verifySide(record, payload.sideTicket);
             this._endByClock(record);
+            if (record.battle.ended || record.endedReason) {
+                return this._terminalResponse(record, sideTicket.side, { recovered: true });
+            }
             return this._response(record, sideTicket.side, { recovered: true });
         }
         return {
