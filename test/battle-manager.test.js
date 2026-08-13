@@ -547,6 +547,27 @@ test('trainer forced switch is resolved by Foul Play and action retry is idempot
     assert.deepEqual(ai.calls.map(call => call.requestType), ['team', 'move', 'switch']);
 });
 
+test('signed trainer battle ignores client-authored moves and items', async t => {
+    const ai = new FakeFoulPlay(['team 1']);
+    const manager = new BattleManager({
+        foulPlayClient: ai,
+        trainerTicketSecret: SECRET,
+        trainerAiEnabled: true,
+    });
+    t.after(() => manager.close());
+    const opponents = [{ species: 'Hoppip', level: 8, shiny: false }];
+    const input = payload('trainer');
+    input.requestId = 'signed-route-trainer-start';
+    input.battleTicket = battleTicket(opponents, 'trainer');
+    input.p2.team = [pokemon('Hoppip', ['Explosion'], { level: 8, item: 'Choice Band' })];
+
+    const started = await manager.start(input);
+    const record = manager.records.get(started.battleId);
+    assert.equal(record.battle.p2.pokemon[0].item, '');
+    assert.equal(record.battle.p2.pokemon[0].moveSlots.some(slot => slot.id === 'explosion'), false);
+    assert.equal(record.battle.p2.pokemon[0].level, 8);
+});
+
 test('persisted PP are restored by slot without changing the legal move order', async t => {
     const manager = new BattleManager({ foulPlayClient: new FakeFoulPlay() });
     t.after(() => manager.close());

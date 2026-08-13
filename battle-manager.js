@@ -82,6 +82,15 @@ function canonicalWildTeam(opponents) {
     });
 }
 
+function canonicalSignedOpponentTeam(opponents) {
+    if (!Array.isArray(opponents) || !opponents.length) {
+        throw new BattleInputError('The signed opponent team is empty.', 401);
+    }
+    return opponents.every(opponent => Array.isArray(opponent?.moves) && opponent.moves.length)
+        ? sanitizeTeam(opponents)
+        : canonicalWildTeam(opponents);
+}
+
 function persistedP1State(p1State, mon, index) {
     const slot = Number(mon.clientSlot) || index + 1;
     const slotStates = p1State.__slots;
@@ -489,8 +498,8 @@ export class BattleManager {
             name: ticketPayload?.sub || payload.p1.name || 'Player',
             team: p1Team,
         });
-        const p2Team = ticketPayload?.kind === 'battle' && encounterType === 'wild'
-            ? canonicalWildTeam(ticketPayload.opponents || [])
+        const p2Team = ticketPayload?.kind === 'battle'
+            ? canonicalSignedOpponentTeam(ticketPayload.opponents || [])
             : sanitizeTeam(payload.p2.team);
         battle.setPlayer('p2', {
             name: payload.p2.name || (encounterType === 'trainer' ? 'Trainer' : 'Wild Pokemon'),
