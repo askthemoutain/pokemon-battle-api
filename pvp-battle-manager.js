@@ -24,6 +24,7 @@ const mutationRateLimit = 30;
 const startRateLimit = 8;
 const settlementResponseMaxBytes = 16384;
 const settlementRetryCapMs = 60 * 1000;
+const evStats = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
 const clone = value => JSON.parse(JSON.stringify(value));
 
 async function boundedResponseText(response, maximumBytes) {
@@ -109,10 +110,28 @@ function safeTeam(team, teamSchema) {
     const normalized = team.map(mon => {
         const level = Math.max(1, Math.min(100, Number(mon.level) || 50));
         const species = validator.dex.species.get(mon.species);
-        const evs = Object.fromEntries(Object.entries(mon.evs || {}).map(([stat, value]) => [stat, Number(value) || 0]));
+        const rawEvs = mon.evs ?? {};
+        if (typeof rawEvs !== 'object' || Array.isArray(rawEvs)) {
+            throw new PvpInputError('Invalid PvP team: EVs must be a stat object.');
+        }
+        const evs = {};
+        for (const [stat, value] of Object.entries(rawEvs)) {
+            const numericValue = typeof value === 'number'
+                ? value
+                : (typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN);
+            if (!evStats.includes(stat) || !Number.isFinite(numericValue) || !Number.isInteger(numericValue)) {
+                throw new PvpInputError('Invalid PvP team: EVs must use integer values for known stats.');
+            }
+            evs[stat] = numericValue;
+        }
         const evTotal = Object.values(evs).reduce((sum, value) => sum + value, 0);
-        if (evTotal <= 510 && (evTotal === 0 || level !== 100) && !Object.values(evs).some(value => value % 4 !== 0)) {
-            const marker = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'].find(stat => Number(evs[stat] || 0) < 252) || 'hp';
+        const marker = evStats.find(stat => {
+            const value = Number(evs[stat] || 0);
+            return value < 252 && value % 4 !== 3;
+        });
+        const markerInputIsLegal = Object.values(evs).every(value => value >= 0 && value <= 255);
+        const needsIntentMarker = (level > 1 && evTotal === 0) || (level === 50 && evTotal % 4 === 0);
+        if (markerInputIsLegal && marker && evTotal >= 0 && evTotal < 510 && needsIntentMarker) {
             evs[marker] = Number(evs[marker] || 0) + 1;
         }
         const normalizedMon = {

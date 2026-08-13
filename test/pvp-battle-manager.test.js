@@ -789,6 +789,102 @@ test('start idempotency fingerprint binds the team schema', async t => {
     );
 });
 
+test('level 50 EV intent marker follows the aggregate EV total', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const data = bundle('347', '', {
+        p1: [{
+            species: 'Pikachu', moves: ['Thunder Shock'], ability: 'Static', nature: 'Serious', level: 50,
+            evs: { hp: 251, atk: 1 },
+        }],
+        p2: [mon('Caterpie', ['Tackle'])],
+    });
+    const started = await start(manager, data, 'aggregate-ev-intent');
+    const evs = manager.records.get(started.battleId).battle.p1.pokemon[0].set.evs;
+    assert.equal(evs.hp, 251, 'the marker must not cross HP from 3 mod 4 to the next stat point');
+    assert.equal(evs.atk, 2, 'the next canonical stat with safe headroom receives the marker');
+    assert.equal(Object.values(evs).reduce((sum, value) => sum + value, 0), 253);
+});
+
+test('a 508 EV level 50 set gets a stat-neutral marker while level 100 stays exact', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const sourceEvs = { hp: 251, atk: 251, def: 6 };
+    for (const [suffix, level, expectedTotal] of [
+        ['355', 50, 509],
+        ['356', 100, 508],
+    ]) {
+        const data = bundle(suffix, '', {
+            p1: [{
+                species: 'Pikachu', moves: ['Thunder Shock'], ability: 'Static', nature: 'Serious', level,
+                evs: sourceEvs,
+            }],
+            p2: [mon('Caterpie', ['Tackle'])],
+        });
+        const started = await start(manager, data, `ev-508-${suffix}`);
+        const evs = manager.records.get(started.battleId).battle.p1.pokemon[0].set.evs;
+        assert.equal(Object.values(evs).reduce((sum, value) => sum + value, 0), expectedTotal);
+        for (const [stat, value] of Object.entries(sourceEvs)) {
+            assert.equal(Math.floor(evs[stat] / 4), Math.floor(value / 4), `${stat} must retain its stat contribution`);
+        }
+        if (level === 50) assert.equal(evs.def, 7, 'the first stat-safe slot receives the marker');
+        else assert.deepEqual({ hp: evs.hp, atk: evs.atk, def: evs.def }, sourceEvs);
+    }
+});
+
+test('EV intent marker respects the 510 budget and level 100 policy', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const cases = [
+        ['348', 50, { hp: 252, atk: 252, def: 6 }, 510],
+        ['349', 100, { hp: 251, atk: 1 }, 252],
+        ['350', 100, {}, 1],
+        ['354', 45, { hp: 251, atk: 1 }, 252],
+        ['357', 1, {}, 0],
+    ];
+    for (const [suffix, level, sourceEvs, expectedTotal] of cases) {
+        const data = bundle(suffix, '', {
+            p1: [{
+                species: 'Pikachu', moves: ['Thunder Shock'], ability: 'Static', nature: 'Serious', level,
+                evs: sourceEvs,
+            }],
+            p2: [mon('Caterpie', ['Tackle'])],
+        });
+        const started = await start(manager, data, `ev-policy-${suffix}`);
+        const evs = manager.records.get(started.battleId).battle.p1.pokemon[0].set.evs;
+        assert.equal(Object.values(evs).reduce((sum, value) => sum + value, 0), expectedTotal);
+        if (suffix === '354') {
+            assert.equal(evs.hp, sourceEvs.hp);
+            assert.equal(evs.atk, sourceEvs.atk);
+        }
+    }
+});
+
+test('invalid explicit EVs are rejected without receiving an intent marker', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const cases = [
+        ['351', { hp: 252, atk: 252, def: 7 }, /511 total EVs/i],
+        ['352', { hp: -4, atk: 4 }, /less than 0 (?:EVs|Awakening Values)/i],
+        ['353', { hp: 'not-an-ev' }, /integer values for known stats/i],
+    ];
+    for (const [suffix, evs, pattern] of cases) {
+        const data = bundle(suffix, '', {
+            p1: [{
+                species: 'Pikachu', moves: ['Thunder Shock'], ability: 'Static', nature: 'Serious', level: 50,
+                evs,
+            }],
+            p2: [mon('Caterpie', ['Tackle'])],
+        });
+        await assert.rejects(
+            start(manager, data, `invalid-ev-${suffix}`),
+            error => error.status === 400
+                && error.details?.code === 'TEAM_INVALID'
+                && pattern.test(error.message),
+        );
+    }
+});
+
 test('competitive PvP rejects illegal learnsets, abilities and EV totals independently', async t => {
     const manager = makeManager();
     t.after(() => manager.close());
