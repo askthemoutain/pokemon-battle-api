@@ -112,6 +112,26 @@ test('legacy PvP bootstrap is disabled by default and only available behind the 
     assert.equal(state.success, true);
 });
 
+test('active battle count excludes retained terminal records', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const data = bundle('87');
+    const started = await start(manager, data, 'active-count');
+
+    assert.equal(manager.records.size, 1);
+    assert.equal(manager.getActiveBattleCount(), 1);
+
+    const record = manager.getRecord(started.battleId);
+    record.battle.ended = true;
+    assert.equal(manager.getActiveBattleCount(), 0, 'simulator-ended records are terminal');
+    record.battle.ended = false;
+
+    await manager.forfeit({ battleId: started.battleId, sideTicket: data.sideTicket('p1') });
+
+    assert.equal(manager.records.size, 1, 'terminal records remain available for replay and cleanup');
+    assert.equal(manager.getActiveBattleCount(), 0);
+});
+
 test('a replaced or unavailable session cannot mutate PvP state', async t => {
     for (const [suffix, validator, expectedStatus] of [
         ['82', async request => request.action === 'start', 401],

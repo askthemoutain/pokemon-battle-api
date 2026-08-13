@@ -432,6 +432,14 @@ export class PvpBattleManager {
         return this.records.get(battleId);
     }
 
+    getActiveBattleCount() {
+        let active = 0;
+        for (const record of this.records.values()) {
+            if (record?.battle && !record.battle.ended && !record.endedReason) active++;
+        }
+        return active;
+    }
+
     _verifySide(record, token) {
         let ticket;
         try {

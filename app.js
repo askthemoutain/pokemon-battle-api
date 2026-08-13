@@ -5,19 +5,36 @@ import cors from 'cors';
 import { BattleInputError, TrainerUnavailableError } from './battle-manager.js';
 import { PvpInputError } from './pvp-battle-manager.js';
 
+const CANONICAL_GAME_ORIGIN = 'https://pokemoncovenant.altervista.org';
+const WWW_GAME_ORIGIN = 'https://www.pokemoncovenant.altervista.org';
+
+class CorsOriginError extends Error {}
+
 
 export function createApp(manager, pvpManager = null) {
     const app = express();
-    const allowedOrigins = (
-        process.env.ALLOWED_ORIGINS || 'https://pokemoncovenant.altervista.org,http://gdrcd.test'
-    ).split(',').map(origin => origin.trim()).filter(Boolean);
+    const allowedOrigins = new Set((
+        process.env.ALLOWED_ORIGINS || CANONICAL_GAME_ORIGIN
+    ).split(',').map(origin => origin.trim()).filter(Boolean));
+    // AlterVista serves the same game on both hostnames. Grant the exact www
+    // sibling only when the production canonical origin is already allowlisted;
+    // unrelated/custom allowlists remain unchanged and fail closed.
+    if (allowedOrigins.has(CANONICAL_GAME_ORIGIN)) {
+        allowedOrigins.add(WWW_GAME_ORIGIN);
+    }
 
     app.use(cors({
         origin(origin, callback) {
-            if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-            return callback(new Error('Origin not allowed'));
+            if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+            return callback(new CorsOriginError('Origin not allowed'));
         },
     }));
+    app.use((error, req, res, next) => {
+        if (error instanceof CorsOriginError) {
+            return res.status(403).json({ success: false, error: 'Origin not allowed.' });
+        }
+        return next(error);
+    });
     app.use(express.json({ limit: '1mb' }));
 
     const requireSignature = process.env.REQUIRE_BATTLE_API_SIGNATURE === '1';
@@ -90,7 +107,7 @@ export function createApp(manager, pvpManager = null) {
         trainerAiEnabled: manager.trainerAiEnabled,
         foulPlayConfigured: Boolean(manager.foulPlayClient?.configured),
         activeBattles: manager.records.size,
-        activePvpBattles: pvpManager ? pvpManager.records.size : 0,
+        activePvpBattles: pvpManager ? pvpManager.getActiveBattleCount() : 0,
     }));
     app.get('/', (req, res) => res.status(200).send('Pokemon Battle API is running.'));
     return app;
