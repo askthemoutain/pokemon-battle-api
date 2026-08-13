@@ -85,6 +85,7 @@ export function verifyPvpBattleTicket(token, secret, nowSeconds = Math.floor(Dat
         !payload.participants?.p2 ||
         !Array.isArray(payload.teams?.p1) || !payload.teams.p1.length ||
         !Array.isArray(payload.teams?.p2) || !payload.teams.p2.length ||
+        (payload.teamSchema !== undefined && payload.teamSchema !== 2) ||
         (payload.v === 2 && payload.serverStart !== true) ||
         !assertFresh(payload, nowSeconds)
     ) {

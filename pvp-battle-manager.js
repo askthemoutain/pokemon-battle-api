@@ -69,20 +69,53 @@ export class PvpInputError extends Error {
     }
 }
 
-function safeTeam(team) {
+function deterministicLegalFallback(mon, validator) {
+    const species = validator.dex.species.get(mon.species);
+    if (!species.exists) return '';
+    const level = Math.max(1, Math.min(100, Number(mon.level) || 50));
+    const candidates = new Map();
+    for (const entry of validator.dex.species.getFullLearnset(species.id)) {
+        for (const [moveId, sources] of Object.entries(entry.learnset || {})) {
+            for (const source of sources) {
+                const match = /^(\d)L(\d+)$/.exec(source);
+                if (!match || Number(match[2]) > level) continue;
+                const rank = [Number(match[1]), Number(match[2])];
+                const previous = candidates.get(moveId);
+                if (!previous || rank[0] > previous[0] || (rank[0] === previous[0] && rank[1] > previous[1])) {
+                    candidates.set(moveId, rank);
+                }
+            }
+        }
+    }
+    const ranked = [...candidates.entries()].sort((a, b) => (
+        b[1][0] - a[1][0] || b[1][1] - a[1][1] || a[0].localeCompare(b[0])
+    ));
+    for (const [moveId] of ranked) {
+        const problem = validator.checkCanLearn(validator.dex.moves.get(moveId), species, undefined, {
+            ...mon,
+            level,
+            moves: [moveId],
+        });
+        if (!problem) return validator.dex.moves.get(moveId).name;
+    }
+    return '';
+}
+
+function safeTeam(team, teamSchema) {
     if (!Array.isArray(team) || !team.length || team.length > 6) {
         throw new PvpInputError('A valid PvP team is required.');
     }
+    const validator = TeamValidator.get(pvpFormat);
     const normalized = team.map(mon => {
         const level = Math.max(1, Math.min(100, Number(mon.level) || 50));
-        const species = Dex.species.get(mon.species);
+        const species = validator.dex.species.get(mon.species);
         const evs = Object.fromEntries(Object.entries(mon.evs || {}).map(([stat, value]) => [stat, Number(value) || 0]));
         const evTotal = Object.values(evs).reduce((sum, value) => sum + value, 0);
         if (evTotal <= 510 && (evTotal === 0 || level !== 100) && !Object.values(evs).some(value => value % 4 !== 0)) {
             const marker = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'].find(stat => Number(evs[stat] || 0) < 252) || 'hp';
             evs[marker] = Number(evs[marker] || 0) + 1;
         }
-        return {
+        const normalizedMon = {
             ...mon,
             name: String(mon.name || mon.species || '').slice(0, 18),
             ability: !mon.ability || mon.ability === '???' ? (species.abilities?.[0] || '') : mon.ability,
@@ -92,8 +125,22 @@ function safeTeam(team) {
             level,
             evs,
         };
+        if (teamSchema === 2 && normalizedMon.moves.length === 0) {
+            const fallback = deterministicLegalFallback(normalizedMon, validator);
+            if (fallback) normalizedMon.moves = [fallback];
+        } else if (teamSchema === undefined && normalizedMon.moves.length === 1
+            && validator.dex.moves.get(normalizedMon.moves[0]).id === 'tackle'
+            && validator.checkCanLearn(validator.dex.moves.get('tackle'), species, undefined, normalizedMon)) {
+            // Schema-less snapshots predate the explicit empty-moves contract
+            // and PHP represented every empty set as Tackle. Repair exactly
+            // that legacy sentinel; never rewrite a legal Tackle or any other
+            // explicit move choice.
+            const fallback = deterministicLegalFallback(normalizedMon, validator);
+            if (fallback) normalizedMon.moves = [fallback];
+        }
+        return normalizedMon;
     });
-    const problems = TeamValidator.get(pvpFormat).validateTeam(clone(normalized));
+    const problems = validator.validateTeam(clone(normalized));
     if (problems?.length) {
         throw new PvpInputError(`Invalid PvP team: ${problems[0]}`);
     }
@@ -749,6 +796,7 @@ export class PvpBattleManager {
             localBattleId: ticket.localBattleId,
             participants: ticket.participants,
             teams: ticket.teams,
+            teamSchema: ticket.teamSchema ?? null,
         })).digest('hex');
         const existing = this.startRequests.get(requestId);
         if (existing && existing.fingerprint !== fingerprint) {
@@ -787,8 +835,8 @@ export class PvpBattleManager {
         let p1Team;
         let p2Team;
         try {
-            p1Team = safeTeam(ticket.teams.p1);
-            p2Team = safeTeam(ticket.teams.p2);
+            p1Team = safeTeam(ticket.teams.p1, ticket.teamSchema);
+            p2Team = safeTeam(ticket.teams.p2, ticket.teamSchema);
         } catch (error) {
             if (!(error instanceof PvpInputError)) throw error;
             throw new PvpInputError(error.message, 400, {

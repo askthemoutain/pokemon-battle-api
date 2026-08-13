@@ -17,7 +17,7 @@ function mon(species, moves, level = 50) {
     return { species, moves, level, nature: 'Serious' };
 }
 
-function bundle(suffix = '1', sharedP1 = '', customTeams = null) {
+function bundle(suffix = '1', sharedP1 = '', customTeams = null, teamSchema = 2) {
     const localBattleId = `11111111-1111-4111-8111-${suffix.padStart(12, '0')}`;
     const participants = { p1: sharedP1 || `PlayerA${suffix}`, p2: `PlayerB${suffix}` };
     const teams = customTeams || {
@@ -25,7 +25,7 @@ function bundle(suffix = '1', sharedP1 = '', customTeams = null) {
         p2: [mon('Caterpie', ['Tackle'])],
     };
     const exp = Math.floor(Date.now() / 1000) + 300;
-    const battleTicket = signToken({
+    const ticketPayload = {
         v: 2,
         kind: 'pvp-battle',
         aud: 'pokemon-battle-api',
@@ -34,8 +34,10 @@ function bundle(suffix = '1', sharedP1 = '', customTeams = null) {
         participants,
         teams,
         exp,
-    }, SECRET);
-    const data = { localBattleId, participants, teams, battleTicket, sideTicket: null, battleId: '' };
+    };
+    if (teamSchema !== null) ticketPayload.teamSchema = teamSchema;
+    const battleTicket = signToken(ticketPayload, SECRET);
+    const data = { localBattleId, participants, teams, teamSchema, battleTicket, sideTicket: null, battleId: '' };
     data.sideTicket = (side, nowSeconds = Math.floor(Date.now() / 1000)) => signToken({
         v: 2,
         kind: 'pvp-side',
@@ -577,6 +579,7 @@ test('PvP start retry accepts a freshly signed equivalent ticket after a lost bi
         localBattleId: data.localBattleId,
         participants: { p2: data.participants.p2, p1: data.participants.p1 },
         teams: { p2: data.teams.p2, p1: data.teams.p1 },
+        teamSchema: data.teamSchema,
         iat: Math.floor(Date.now() / 1000),
         exp: Math.floor(Date.now() / 1000) + 300,
         nonce: 'fresh-ticket-nonce',
@@ -689,6 +692,7 @@ test('PvP rejects invalid canonical team data before simulation', async t => {
         serverStart: true,
         localBattleId: data.localBattleId,
         participants: data.participants,
+        teamSchema: 2,
         teams: {
             ...data.teams,
             p1: [mon('Pikachu', ['Definitely Not A Move'])],
@@ -711,6 +715,77 @@ test('PvP rejects invalid canonical team data before simulation', async t => {
             assert.equal(rejection.localBattleId, data.localBattleId);
             return true;
         },
+    );
+});
+
+test('schema 2 empty moves receive a deterministic legal fallback', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const data = bundle('341', '', {
+        p1: [mon('Pikachu', [])],
+        p2: [mon('Caterpie', ['Tackle'])],
+    });
+    const started = await start(manager, data, 'schema-2-empty-moves');
+    const moves = manager.records.get(started.battleId).battle.p1.pokemon[0].moveSlots.map(slot => slot.id);
+    assert.equal(moves.length, 1);
+    assert.notEqual(moves[0], 'tackle');
+});
+
+test('schema 2 fallback also supports old-generation level-up learnsets', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const data = bundle('346', '', {
+        p1: [mon('Butterfree', [], 50)],
+        p2: [mon('Caterpie', ['Tackle'])],
+    });
+    const started = await start(manager, data, 'schema-2-old-gen-fallback');
+    const moves = manager.records.get(started.battleId).battle.p1.pokemon[0].moveSlots.map(slot => slot.id);
+    assert.equal(moves.length, 1);
+});
+
+test('legacy synthetic Tackle is repaired only when illegal for that species', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    for (const [suffix, species, expectedMove] of [
+        ['342', 'Pikachu', null],
+        ['343', 'Breloom', 'tackle'],
+    ]) {
+        const data = bundle(suffix, '', {
+            p1: [mon(species, ['Tackle'])],
+            p2: [mon('Caterpie', ['Tackle'])],
+        }, null);
+        const started = await start(manager, data, `legacy-tackle-${suffix}`);
+        const move = manager.records.get(started.battleId).battle.p1.pokemon[0].moveSlots[0].id;
+        if (expectedMove) assert.equal(move, expectedMove);
+        else assert.notEqual(move, 'tackle');
+    }
+});
+
+test('schema 2 never rewrites an explicitly illegal Tackle', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const data = bundle('344', '', {
+        p1: [mon('Pikachu', ['Tackle'])],
+        p2: [mon('Caterpie', ['Tackle'])],
+    });
+    await assert.rejects(
+        start(manager, data, 'schema-2-explicit-illegal'),
+        error => error.status === 400
+            && error.details?.code === 'TEAM_INVALID'
+            && /can't learn Tackle/i.test(error.message),
+    );
+});
+
+test('start idempotency fingerprint binds the team schema', async t => {
+    const manager = makeManager();
+    t.after(() => manager.close());
+    const current = bundle('345');
+    const legacy = bundle('345', '', current.teams, null);
+    const requestId = 'schema-fingerprint';
+    await manager.start({ requestId, battleTicket: current.battleTicket, sideTicket: current.sideTicket('p1') });
+    await assert.rejects(
+        manager.start({ requestId, battleTicket: legacy.battleTicket, sideTicket: legacy.sideTicket('p1') }),
+        error => error.status === 409 && /requestId was reused/i.test(error.message),
     );
 });
 
